@@ -1,0 +1,14 @@
+[Unit]
+Description=司命本机 15m 失联告警与预排发件箱代发巡检 (siming-deadman)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=siming
+Group=siming
+ExecStart=/usr/bin/python3 /opt/siming-edge/siming_edge.py --state-dir /var/lib/siming-edge deadman-check --silence-sec 900
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/siming-edge

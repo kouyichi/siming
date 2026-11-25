@@ -1,0 +1,10 @@
+[Unit]
+Description=每 2 分钟运行司命主节拍 (siming-tick)
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=2min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

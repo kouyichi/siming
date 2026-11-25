@@ -1,0 +1,79 @@
+# Siming 数据源健康监控配置示例
+# 复制到 ~/.config/siming/sources.toml 后按需裁剪或调整 max_silence_sec
+
+[sources.agent_sessions]
+kind = "local_log"
+max_silence_sec = 900
+description = "Claude / Codex / agy / OpenCode / Hermes 用户输入 2m 增量扫描"
+
+[sources.wait_source]
+kind = "internal"
+max_silence_sec = 900
+description = "跨 Agent 挂起触发源（time / event / probe / intent）"
+
+[sources.buy_track]
+kind = "local_json"
+max_silence_sec = 86400
+path = "~/buy/track/data/auto.json"
+description = "电商大件订单与价保跟踪（可选）"
+
+[sources.price_watch]
+kind = "local_json"
+max_silence_sec = 86400
+path = "~/.hermes/scripts/buy-price-watch/orders.json"
+description = "网购商品通用保价监控（降价提醒，不自动代点申请）"
+
+[sources.cn_calendar]
+kind = "calendar"
+max_silence_sec = 691200
+description = "中国节假日调休、城市限行、12306/114 与农历窗口"
+
+[sources.memos_vault]
+kind = "local_md"
+max_silence_sec = 86400
+path = "~/Documents/Obsidian Vault/60-共享记忆"
+description = "Obsidian 共享记忆与本地备忘"
+
+[sources.gh_prs]
+kind = "probe"
+max_silence_sec = 7200
+description = "关注 GitHub PR 状态与点名变化"
+
+[sources.edge_vps]
+kind = "ssh_edge"
+max_silence_sec = 900
+description = "公网 VPS 边缘收信队列与预排发件箱同步（可选）"
+
+[sources.ios_hb]
+kind = "edge_heartbeat"
+max_silence_sec = 93600
+description = "iPhone 每日快捷指令心跳（未配手机前标 UNCONFIGURED）"
+
+[sources.mail163]
+kind = "omamail"
+max_silence_sec = 3600
+host = "imap.163.com"
+port = 993
+folders = ["INBOX"]
+secret_name = "mail163"
+description = "Omamail / IMAP 多邮箱桥接聚合摘要"
+
+[sources.open_meteo]
+kind = "probe"
+max_silence_sec = 691200
+description = "Open-Meteo 逐小时天气预报"
+
+[sources.meituan_orders]
+kind = "cdp_9222"
+max_silence_sec = 172800
+description = "美团外卖 H5 订单商品明细只读同步（可选）"
+
+[sources.douyin_orders]
+kind = "cdp_9222"
+max_silence_sec = 604800
+description = "抖音商城网页订单只读同步（可选）"
+
+[sources.ios_tesla]
+kind = "edge_push"
+max_silence_sec = 604800
+description = "电车蓝牙断开零唤醒状态同步（可选）"

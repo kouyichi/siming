@@ -1,0 +1,10 @@
+[Unit]
+Description=每日 04:20 运行司命数据库在线备份与恢复演练
+
+[Timer]
+OnCalendar=*-*-* 04:20:00
+Persistent=true
+RandomizedDelaySec=60s
+
+[Install]
+WantedBy=timers.target

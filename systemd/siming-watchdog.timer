@@ -1,0 +1,10 @@
+[Unit]
+Description=每 2 分钟运行司命看门狗 (siming-watchdog)
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=2min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

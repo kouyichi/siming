@@ -1,0 +1,15 @@
+[Unit]
+Description=司命主节拍（采集器 + 2m 会话扫描 + wait_source + evald + router 窗口）
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Work/siming
+Environment=TMPDIR=%h/.cache/agent-tmp
+# 可选：若需要经本机代理访问外部 API，取消下面两行注释并填写代理地址
+# Environment=HTTP_PROXY=http://127.0.0.1:7890
+# Environment=HTTPS_PROXY=http://127.0.0.1:7890
+Environment=NO_PROXY=localhost,127.0.0.1,::1
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/siming tick
+TimeoutStartSec=240

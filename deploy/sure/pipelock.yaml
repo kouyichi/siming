@@ -1,0 +1,76 @@
+# Siming v5 (W1-1) — Pipelock AI Security Proxy Policy for Self-Hosted Sure
+# Enforces read-only default for AI/MCP clients and mandates Siming A2 approval token for any mutation.
+
+version: "1.0"
+service: siming-sure-pipelock
+
+network:
+  listen: "127.0.0.1:3032"
+  upstream: "http://sure-web:3000"
+  allow_external_egress: false
+  allowed_hosts:
+    - "127.0.0.1"
+    - "localhost"
+    - "sure-web"
+
+defaults:
+  mode: read_only
+  deny_unknown_methods: true
+  audit_log: true
+  rate_limit_rpm: 120
+
+rules:
+  - id: allow-health-and-reads
+    description: "Allow read-only financial queries from Siming & sure-mcp-server"
+    methods: ["GET", "HEAD", "OPTIONS"]
+    paths:
+      - "/up"
+      - "/api/v1/health"
+      - "/api/v1/accounts*"
+      - "/api/v1/transactions*"
+      - "/api/v1/categories*"
+      - "/api/v1/rules*"
+      - "/api/v1/assets*"
+      - "/api/v1/valuations*"
+      - "/api/v1/net_worth*"
+      - "/api/v1/cashflow*"
+    action: allow
+    tier: A0
+
+  - id: require-a2-for-writes
+    description: "Any ledger write, asset sync, or rule mutation requires a verified Siming A2 approval token"
+    methods: ["POST", "PUT", "PATCH"]
+    paths:
+      - "/api/v1/transactions*"
+      - "/api/v1/assets*"
+      - "/api/v1/rules*"
+      - "/api/v1/tags*"
+    action: require_approval
+    tier: A2
+    required_headers:
+      - "X-Siming-Approval-Token"
+    token_pattern: "^A[0-9]{2,8}$"
+
+  - id: deny-destructive-or-transfers
+    description: "Block delete/transfer endpoints unless explicitly carrying A2 approval and within guardrail cap"
+    methods: ["DELETE", "POST"]
+    paths:
+      - "/api/v1/transfers*"
+      - "/api/v1/accounts/*/delete"
+      - "/api/v1/transactions/*"
+    action: require_approval
+    tier: A2
+    required_headers:
+      - "X-Siming-Approval-Token"
+    max_amount_cny: 50000
+
+redaction:
+  enabled: true
+  strip_request_headers:
+    - "Cookie"
+  mask_response_fields:
+    - "password"
+    - "secret_key"
+    - "card_number"
+    - "cvv"
+    - "access_token"

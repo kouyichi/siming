@@ -1,0 +1,222 @@
+# NAS Homelab Stack — Siming v5 (W2-2)
+# Hosts: Sure (we-promise/sure + Postgres + Redis + Sidekiq), Home Assistant + sure-hass bridge,
+# and an encrypted incremental backup sidecar (Desktop -> NAS -> Edge VPS).
+#
+# Security defaults:
+# - All exposed ports bind strictly to LAN / Tailscale interface via ${NAS_BIND_IP:-127.0.0.1}
+# - Internal database & Redis stay strictly on the isolated homelab_internal network
+# - Secrets must be injected from .env (chmod 600) or mounted secret files, never hardcoded
+
+name: siming-nas-homelab
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-security: &default-security
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  sure-db:
+    image: postgres:16-alpine
+    container_name: siming-sure-db
+    restart: unless-stopped
+    <<: *default-security
+    logging: *default-logging
+    environment:
+      TZ: Asia/Shanghai
+      POSTGRES_DB: ${SURE_DB_NAME:-sure_production}
+      POSTGRES_USER: ${SURE_DB_USER:-sure}
+      POSTGRES_PASSWORD: ${SURE_DB_PASSWORD:?Set SURE_DB_PASSWORD in .env}
+    volumes:
+      - ${NAS_DATA_ROOT:-/volume1/docker/siming-homelab}/sure/postgres:/var/lib/postgresql/data
+    networks:
+      - homelab_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SURE_DB_USER:-sure} -d ${SURE_DB_NAME:-sure_production}"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  sure-redis:
+    image: redis:7-alpine
+    container_name: siming-sure-redis
+    restart: unless-stopped
+    <<: *default-security
+    logging: *default-logging
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass ${SURE_REDIS_PASSWORD:?Set SURE_REDIS_PASSWORD in .env}
+    volumes:
+      - ${NAS_DATA_ROOT:-/volume1/docker/siming-homelab}/sure/redis:/data
+    networks:
+      - homelab_internal
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$SURE_REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    environment:
+      TZ: Asia/Shanghai
+      SURE_REDIS_PASSWORD: ${SURE_REDIS_PASSWORD:?Set SURE_REDIS_PASSWORD in .env}
+
+  sure-web:
+    image: ghcr.io/we-promise/sure:${SURE_IMAGE_TAG:-latest}
+    container_name: siming-sure-web
+    restart: unless-stopped
+    <<: *default-security
+    logging: *default-logging
+    depends_on:
+      sure-db:
+        condition: service_healthy
+      sure-redis:
+        condition: service_healthy
+    ports:
+      - "${NAS_BIND_IP:-127.0.0.1}:3000:3000"
+    environment:
+      TZ: Asia/Shanghai
+      RAILS_ENV: production
+      SELF_HOSTED: "true"
+      RAILS_FORCE_SSL: "false"
+      RAILS_ASSUME_SSL: "false"
+      SECRET_KEY_BASE: ${SURE_SECRET_KEY_BASE:?Set SURE_SECRET_KEY_BASE in .env}
+      DB_HOST: sure-db
+      DB_PORT: "5432"
+      POSTGRES_DB: ${SURE_DB_NAME:-sure_production}
+      POSTGRES_USER: ${SURE_DB_USER:-sure}
+      POSTGRES_PASSWORD: ${SURE_DB_PASSWORD:?Set SURE_DB_PASSWORD in .env}
+      DATABASE_URL: postgresql://${SURE_DB_USER:-sure}:${SURE_DB_PASSWORD:?Set SURE_DB_PASSWORD in .env}@sure-db:5432/${SURE_DB_NAME:-sure_production}
+      REDIS_URL: redis://:${SURE_REDIS_PASSWORD:?Set SURE_REDIS_PASSWORD in .env}@sure-redis:6379/0
+      DEFAULT_CURRENCY: CNY
+    volumes:
+      - ${NAS_DATA_ROOT:-/volume1/docker/siming-homelab}/sure/storage:/rails/storage
+    networks:
+      - homelab_internal
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/up || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  sure-worker:
+    image: ghcr.io/we-promise/sure:${SURE_IMAGE_TAG:-latest}
+    container_name: siming-sure-worker
+    restart: unless-stopped
+    <<: *default-security
+    logging: *default-logging
+    command: ["bundle", "exec", "sidekiq"]
+    depends_on:
+      sure-db:
+        condition: service_healthy
+      sure-redis:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      RAILS_ENV: production
+      SELF_HOSTED: "true"
+      SECRET_KEY_BASE: ${SURE_SECRET_KEY_BASE:?Set SURE_SECRET_KEY_BASE in .env}
+      DB_HOST: sure-db
+      DB_PORT: "5432"
+      POSTGRES_DB: ${SURE_DB_NAME:-sure_production}
+      POSTGRES_USER: ${SURE_DB_USER:-sure}
+      POSTGRES_PASSWORD: ${SURE_DB_PASSWORD:?Set SURE_DB_PASSWORD in .env}
+      DATABASE_URL: postgresql://${SURE_DB_USER:-sure}:${SURE_DB_PASSWORD:?Set SURE_DB_PASSWORD in .env}@sure-db:5432/${SURE_DB_NAME:-sure_production}
+      REDIS_URL: redis://:${SURE_REDIS_PASSWORD:?Set SURE_REDIS_PASSWORD in .env}@sure-redis:6379/0
+    volumes:
+      - ${NAS_DATA_ROOT:-/volume1/docker/siming-homelab}/sure/storage:/rails/storage
+    networks:
+      - homelab_internal
+
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:${HAOS_IMAGE_TAG:-stable}
+    container_name: siming-haos
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "${NAS_BIND_IP:-127.0.0.1}:8123:8123"
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ${NAS_DATA_ROOT:-/volume1/docker/siming-homelab}/haos/config:/config
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - homelab_internal
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8123/manifest.json >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  sure-hass:
+    image: python:3.12-alpine
+    container_name: siming-sure-hass-bridge
+    restart: unless-stopped
+    <<: *default-security
+    logging: *default-logging
+    depends_on:
+      sure-web:
+        condition: service_healthy
+      homeassistant:
+        condition: service_started
+    environment:
+      TZ: Asia/Shanghai
+      SURE_API_URL: http://sure-web:3000/api/v1
+      SURE_API_TOKEN: ${SURE_API_TOKEN:?Set SURE_API_TOKEN in .env}
+      HAOS_URL: ${HAOS_URL:-http://homeassistant:8123}
+      HAOS_TOKEN: ${HAOS_TOKEN:?Set HAOS_TOKEN in .env}
+      SYNC_INTERVAL_SEC: ${SURE_HASS_INTERVAL_SEC:-300}
+    volumes:
+      - ${NAS_DATA_ROOT:-/volume1/docker/siming-homelab}/sure-hass:/app:ro
+    working_dir: /app
+    command: ["sh", "-c", "python3 -u bridge.py"]
+    networks:
+      - homelab_internal
+
+  backup-sidecar:
+    image: restic/restic:0.17.3
+    container_name: siming-backup-sidecar
+    restart: unless-stopped
+    <<: *default-security
+    logging: *default-logging
+    depends_on:
+      sure-db:
+        condition: service_healthy
+    environment:
+      TZ: Asia/Shanghai
+      RESTIC_REPOSITORY: ${RESTIC_EDGE_REPO:?Set RESTIC_EDGE_REPO (e.g. sftp:backup@edge-vps:/srv/restic/siming)}
+      RESTIC_PASSWORD_FILE: /run/secrets/restic_password
+      BACKUP_CRON_INTERVAL_SEC: ${BACKUP_INTERVAL_SEC:-21600}
+      KEEP_DAILY: "14"
+      KEEP_WEEKLY: "8"
+      KEEP_MONTHLY: "12"
+    volumes:
+      - ${NAS_DATA_ROOT:-/volume1/docker/siming-homelab}/sure/storage:/backup/sure-storage:ro
+      - ${NAS_DATA_ROOT:-/volume1/docker/siming-homelab}/haos/config:/backup/haos-config:ro
+      - ${NAS_DATA_ROOT:-/volume1/docker/siming-homelab}/desktop-mirror:/backup/desktop-mirror:ro
+      - ${NAS_DATA_ROOT:-/volume1/docker/siming-homelab}/manifests:/backup/manifests:rw
+      - ${NAS_SECRETS_ROOT:-/volume1/docker/siming-homelab/secrets}/restic_password:/run/secrets/restic_password:ro
+      - ${NAS_SECRETS_ROOT:-/volume1/docker/siming-homelab/secrets}/edge_vps_id_ed25519:/root/.ssh/id_ed25519:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          restic backup /backup/sure-storage /backup/haos-config /backup/desktop-mirror --tag nas-homelab --exclude '*.tmp' && \
+          restic forget --keep-daily "$${KEEP_DAILY}" --keep-weekly "$${KEEP_WEEKLY}" --keep-monthly "$${KEEP_MONTHLY}" --prune && \
+          restic check --read-data-subset=5% && \
+          date -Iseconds > /backup/manifests/last_verified_at.txt || true
+          sleep "$${BACKUP_CRON_INTERVAL_SEC}"
+        done
+    networks:
+      - homelab_internal
+
+networks:
+  homelab_internal:
+    driver: bridge
+    name: siming_homelab_internal

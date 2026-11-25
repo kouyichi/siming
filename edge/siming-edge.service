@@ -1,0 +1,20 @@
+[Unit]
+Description=司命边缘收信暂存服务 siming-edge (127.0.0.1:18792)
+After=network.target
+
+[Service]
+Type=simple
+User=siming
+Group=siming
+ExecStart=/usr/bin/python3 /opt/siming-edge/siming_edge.py serve --host 127.0.0.1 --port 18792
+Environment=SIMING_EDGE_STATE=/var/lib/siming-edge SIMING_EDGE_PORT=18792
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/siming-edge
+
+[Install]
+WantedBy=multi-user.target

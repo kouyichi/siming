@@ -1,0 +1,11 @@
+[Unit]
+Description=每 5 分钟运行 siming-deadman 巡检
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

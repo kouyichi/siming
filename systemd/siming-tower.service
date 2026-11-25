@@ -1,0 +1,16 @@
+[Unit]
+Description=司命统一网页控制塔 (Siming v5 Control Tower, 127.0.0.1:8788)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Work/siming
+Environment=TMPDIR=%h/.cache/agent-tmp
+Environment=NO_PROXY=localhost,127.0.0.1,::1
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/Work/siming/.pixi/envs/default/bin/python -m siming.control_tower --host 127.0.0.1 --port 8788
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

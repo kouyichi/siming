@@ -1,0 +1,186 @@
+# Siming 主策略配置文件示例
+# 复制到 ~/.config/siming/policy.yaml 后按需修改（严禁将真实凭据提交到 Git）
+
+policy_version: 1
+timezone: Asia/Shanghai
+
+# 常规安静时段（夜猫子引擎启用后会结合电脑活跃与手机睡眠信号动态放行或延后）
+quiet_hours:
+  start: "23:30"
+  end: "07:30"
+
+# 固定聚合推送窗口
+windows:
+  morning_brief: "08:15"   # 晨札汇总（入睡时自动延后到自然醒）
+  pickup_batch: "18:00"    # 下班顺路取件码汇总
+  night_batch_run: "01:30" # 夜间离线蒸馏与归档
+
+# 通知出口（经由 Hermes Gateway 统一收口）
+channels:
+  qq_target: "qqbot:<YOUR_QQ_OPENID>"              # 必填（启用 QQ 推送时）
+  feishu_fallback: "feishu:<YOUR_FEISHU_CHAT_ID>"  # 可选：QQ 故障时兜底群聊
+  hermes_bin: "~/.local/bin/hermes"
+
+# 公网边缘节点配置（可选：用于接收 iPhone 快捷指令短信/位置/睡醒/截屏与断电死人开关）
+edge:
+  ssh_host: ""                                     # 填 ~/.ssh/config 中的 VPS 别名，如 "edge-vps"
+  public_in_url: ""                                # 如 "https://edge.example.com:8443/siming/in"
+  remote_cli: "sudo -n -u siming /usr/bin/python3 /opt/siming-edge/siming_edge.py"
+  pull_interval_sec: 300
+
+# 编码 Agent 与自动续工路由（对接本机 Claude Code / Codex / herdr）
+coding_plan:
+  ai_quota_url: "http://127.0.0.1:18101/api/ai-quota"
+  min_remaining_percent: 10.0
+  claude_bin: "~/.local/bin/claude"
+  codex_bin: "codex"
+  herdr_bin: "/usr/bin/herdr"
+
+# 护栏与防呆参数
+guardrails:
+  worker_timeout_sec: 1800
+  max_done_check_attempts: 2
+  approval_ttl_minutes: 30
+  default_wait_ttl_days: 14
+  max_wait_ttl_days: 30
+  max_explicit_wait_ttl_days: 400
+  ended_subscription_resume_days: 14
+  rule_max_fires_per_hour: 10
+  reboot_suppress_gap_minutes: 30
+  boardgame_cabinet_boxes_limit: 200
+  boardgame_cabinet_volume_m3_limit: 3.0
+
+# 允许远程派单（siming dispatch）的白名单仓库
+whitelisted_repos:
+  siming: "~/Work/siming"
+  # my-app: "~/Work/my-app"
+
+# 全机只读检索（siming ask）的知识库根目录
+knowledge_roots:
+  - "~/Documents/Obsidian Vault"
+  - "~/Work/siming/docs"
+
+# 关注的上游 GitHub PR（如 "owner/repo#123"）
+watched_prs: []
+
+# 农历生日提醒列表（可选）
+# lunar_birthdays:
+#   - name: "家人"
+#     lunar_month: 8
+#     lunar_day: 15
+lunar_birthdays: []
+
+# 常用地点别名（打车 / 外卖默认起点与终点）
+places:
+  家: "示例小区A"
+  公司: "示例写字楼"
+
+# 快递取件短信站点关键字识别（区分当前住址 vs 备用/新房 vs 公司）
+pickup_sites:
+  home_tokens: ["示例小区A"]
+  alt_home_tokens: ["示例小区B"]
+  office_tokens: ["示例写字楼"]
+
+# 日常照护（天气带伞、通勤体制切换、周期用药与耗材补货雷达）
+daily_care:
+  work:
+    weekdays: [0, 1, 2, 3, 4]
+    clock_in_by: "09:35"
+    nominal_off: "19:00"
+    usual_leave_office: "21:30"
+  regimes:
+    - id: "primary_home"
+      until: "2028-01-01"
+      home_label: "示例小区A"
+      home_lat: 39.9042
+      home_lon: 116.4074
+      office_label: "公司"
+      office_lat: 39.9080
+      office_lon: 116.4070
+      commute: "步行"
+      commute_min: 15
+      leave_home_at: "09:00"
+  injection:
+    drug: "周期用药"
+    weekday: 2           # 0=周一 .. 6=周日
+    remind_at: "00:50"
+    remind_next_day: true
+    doses_per_pen: 4
+    hospital_lead_doses: 1
+    hospital: "常用医院"
+
+# 电动车 / Tesla 配置（可选）
+vehicle:
+  kind: "ev"
+  model: "Electric Vehicle (LFP 60kWh)"
+  km_per_pct: 4.35
+  charging_habit: "周边超级充电站 / 外出目的地顺路补电"
+  auto_climate_min_soc_pct: 25.0
+  auto_climate_cold_c: 12.0
+  auto_climate_hot_c: 29.0
+  tail_limit_exempt: true
+
+tesla:
+  # home_garage_coords: [39.9065, 116.4095]
+  home_garage_coords: []
+  virtual_key_pairing_url: "" # 如 "https://tesla.cn/_ak/<your-domain>"
+
+# 账本实时大额告警阈值（日常动账静默入晨札）
+ledger_alerts:
+  super_large_cny_yuan: 20000
+  super_large_fx_usd: 2000
+  realtime_reimburse_cursor_push: false
+
+# 夜猫子动态作息注意力引擎
+night_owl:
+  active_grace_minutes: 35
+  sleep_idle_minutes: 40
+  sleep_window_start: "00:30"
+  sleep_window_end: "12:00"
+  latest_morning_brief: "11:45"
+  explicit_sleep_ttl_hours: 11.0
+
+# 外部消费单笔硬上限（A2 审批前纯代码校验）
+spending_caps:
+  luckin_single_order_yuan: 65.0
+  meituan_single_order_yuan: 120.0
+  jd_replenish_yuan: 500.0
+
+# 美团 H5 受控支付通道（默认关闭！默认仅停在零扣款结算预览页，由用户在官方 App 付款）
+meituan_pay:
+  hermes_handoff:
+    enabled: false
+    provider: ""
+    model: ""
+    instruction_file: "" # 若显式启用，请放在 ~/.config/siming/secrets/ 下且权限 0600
+    max_turns: 20
+    timeout_sec: 150
+
+# QQ 自然语言理解 LLM 兜底（默认关闭，纯规则确定性解析）
+qq_nlu:
+  llm_fallback: false
+
+# 可选：AI 算力账单与研发链路自愈配置
+compute_monitor:
+  redpill_billing_url: ""
+
+self_heal:
+  nous_billing_url: ""
+  intranet_probe_host: ""        # 可选：用于检测公司内网 VPN 是否在线的内网域名
+  remote_host_keywords: ["gpu", "remote"]
+
+# 可选：Home Assistant 网关（令牌存入 ~/.config/siming/secrets/ha-token）
+home_assistant:
+  url: "http://127.0.0.1:8123"
+
+# Control Tower 网页控制塔 CSRF Origin 允许列表
+tower:
+  allowed_hosts:
+    - "127.0.0.1"
+    - "localhost"
+    - "::1"
+    # - "edge.example.com"
+
+# GitHub PR 雷达个人用户名
+github:
+  my_login: ""

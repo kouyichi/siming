@@ -1,0 +1,44 @@
+# 多卡账本配置示例
+# 复制到 ~/.config/siming/accounts.toml 后填写真实别名与后 4 位尾号
+# 安全红线：仅存别名与尾号后 4 位，严禁存入完整卡号、CVV 或密码！
+
+[[accounts]]
+alias = "主力信用卡"
+bank = "招商银行"
+kind = "credit"
+last4 = "1001"
+sms_threshold_yuan = 0
+statement_day = 7
+due_day = 25
+reimburse_cursor = true   # 还款入账时是否自动刷新报销游标卡
+configured = true
+verified_through = ""
+
+[[accounts]]
+alias = "信用卡还款借记卡"
+bank = "招商银行"
+kind = "debit"
+last4 = "1002"
+sms_threshold_yuan = 0
+repay_card = true         # 标记为专用还款卡：转入/自动扣还归为内部划转，防重复统计消费
+reimburse_cursor = true
+configured = true
+verified_through = ""
+
+[[accounts]]
+alias = "日常借记卡"
+bank = "工商银行"
+kind = "debit"
+last4 = "1003"
+sms_threshold_yuan = 300
+configured = true
+verified_through = ""
+
+[[accounts]]
+alias = "备用借记卡"
+bank = "建设银行"
+kind = "debit"
+last4 = "1004"
+sms_threshold_yuan = 500
+configured = true
+verified_through = ""

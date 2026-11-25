@@ -1,0 +1,10 @@
+[Unit]
+Description=每 1 分钟同步边缘队列与本机心跳 (siming-edge-sync)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

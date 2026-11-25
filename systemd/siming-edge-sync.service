@@ -1,0 +1,11 @@
+[Unit]
+Description=司命与公网边缘节点游标同步与心跳推送 (siming-edge-sync)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Work/siming
+Environment=TMPDIR=%h/.cache/agent-tmp
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/siming edge-sync
+TimeoutStartSec=45

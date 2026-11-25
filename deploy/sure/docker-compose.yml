@@ -1,0 +1,143 @@
+# Siming v5 (W1-1) — Self-Hosted Sure Financial OS + MCP + Pipelock AI Security Proxy
+# Privacy invariant: ALL published ports bind strictly to 127.0.0.1 (zero LAN/public exposure).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: siming-sure-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${SURE_DB_USER:-sure}
+      POSTGRES_PASSWORD: ${SURE_DB_PASSWORD:-sure_local_dev_change_me}
+      POSTGRES_DB: ${SURE_DB_NAME:-sure_production}
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - sure_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SURE_DB_USER:-sure} -d ${SURE_DB_NAME:-sure_production}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sure_internal
+
+  redis:
+    image: redis:7-alpine
+    container_name: siming-sure-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:16379:6379"
+    volumes:
+      - sure_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - sure_internal
+
+  sure-web:
+    image: ghcr.io/we-promise/sure:latest
+    container_name: siming-sure-web
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      RAILS_ENV: production
+      SELF_HOSTED: "true"
+      SECRET_KEY_BASE: ${SURE_SECRET_KEY_BASE:-replace_with_64_byte_hex_secret}
+      DATABASE_URL: postgres://${SURE_DB_USER:-sure}:${SURE_DB_PASSWORD:-sure_local_dev_change_me}@postgres:5432/${SURE_DB_NAME:-sure_production}
+      REDIS_URL: redis://redis:6379/0
+      RAILS_ASSUME_SSL: "false"
+      RAILS_FORCE_SSL: "false"
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:3030:3000"
+    volumes:
+      - sure_storage:/rails/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3000/up || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sure_internal
+
+  sure-worker:
+    image: ghcr.io/we-promise/sure:latest
+    container_name: siming-sure-worker
+    restart: unless-stopped
+    command: ["bundle", "exec", "sidekiq"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      sure-web:
+        condition: service_started
+    environment:
+      RAILS_ENV: production
+      SELF_HOSTED: "true"
+      SECRET_KEY_BASE: ${SURE_SECRET_KEY_BASE:-replace_with_64_byte_hex_secret}
+      DATABASE_URL: postgres://${SURE_DB_USER:-sure}:${SURE_DB_PASSWORD:-sure_local_dev_change_me}@postgres:5432/${SURE_DB_NAME:-sure_production}
+      REDIS_URL: redis://redis:6379/0
+      TZ: Asia/Shanghai
+    volumes:
+      - sure_storage:/rails/storage
+    networks:
+      - sure_internal
+
+  pipelock:
+    image: ghcr.io/pipelock/pipelock:latest
+    container_name: siming-sure-pipelock
+    restart: unless-stopped
+    depends_on:
+      sure-web:
+        condition: service_healthy
+    environment:
+      PIPELOCK_CONFIG: /etc/pipelock/policy.yaml
+      PIPELOCK_UPSTREAM: http://sure-web:3000
+      PIPELOCK_BIND: 0.0.0.0:8080
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:3032:8080"
+    volumes:
+      - ./pipelock.yaml:/etc/pipelock/policy.yaml:ro
+    networks:
+      - sure_internal
+
+  sure-mcp-server:
+    image: ghcr.io/we-promise/sure-mcp-server:latest
+    container_name: siming-sure-mcp
+    restart: unless-stopped
+    depends_on:
+      pipelock:
+        condition: service_started
+    environment:
+      SURE_API_BASE_URL: http://pipelock:8080
+      SURE_API_TOKEN: ${SURE_API_TOKEN:-}
+      MCP_BIND_HOST: 0.0.0.0
+      MCP_BIND_PORT: "3031"
+      MCP_READ_ONLY: "true"
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:3031:3031"
+    networks:
+      - sure_internal
+
+volumes:
+  sure_pgdata:
+  sure_redis:
+  sure_storage:
+
+networks:
+  sure_internal:
+    driver: bridge
+    internal: true

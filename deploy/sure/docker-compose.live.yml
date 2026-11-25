@@ -1,0 +1,116 @@
+# Siming v5 (W1-1) — Self-Hosted Sure (we-promise/sure, Maybe Finance fork)
+# Based on upstream compose.example.yml (https://github.com/we-promise/sure/blob/main/compose.example.yml).
+#
+# Privacy invariant: the ONLY published port is 127.0.0.1:3032 (web UI + REST API).
+# Postgres / Redis are reachable only on the private compose network.
+#
+# Secrets live OUTSIDE the repo in ~/.config/siming/secrets/sure.env (0600):
+#   SECRET_KEY_BASE, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
+# NEVER regenerate SECRET_KEY_BASE for an existing install (encryption keys derive from it).
+#
+# Usage:
+#   docker compose -p siming-sure -f deploy/sure/docker-compose.yml up -d
+#   docker compose -p siming-sure -f deploy/sure/docker-compose.yml down        # keeps volumes
+#
+# Note: the earlier draft also listed a Pipelock proxy and a "sure-mcp-server" image; neither
+# exists as a drop-in reverse proxy for the Sure API (upstream Pipelock is an egress/MCP
+# scanning proxy), so they are not deployed. deploy/sure/pipelock.yaml is kept as the
+# Siming-side policy description only (enforced in siming.sure_bridge.pipelock_authorize).
+
+x-sure-env: &sure_env
+  SELF_HOSTED: "true"
+  RAILS_ENV: production
+  RAILS_FORCE_SSL: "false"
+  RAILS_ASSUME_SSL: "false"
+  DB_HOST: db
+  DB_PORT: "5432"
+  REDIS_URL: redis://redis:6379/1
+  TZ: Asia/Shanghai
+
+services:
+  web:
+    image: ghcr.io/we-promise/sure:${SURE_IMAGE_TAG:-stable}
+    container_name: siming-sure-web
+    restart: unless-stopped
+    env_file:
+      - ${HOME}/.config/siming/secrets/sure.env
+    environment:
+      <<: *sure_env
+    ports:
+      - "127.0.0.1:3032:3000"
+    volumes:
+      - app-storage:/rails/storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:3000/up || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      - sure_net
+
+  worker:
+    image: ghcr.io/we-promise/sure:${SURE_IMAGE_TAG:-stable}
+    container_name: siming-sure-worker
+    restart: unless-stopped
+    command: bundle exec sidekiq
+    env_file:
+      - ${HOME}/.config/siming/secrets/sure.env
+    environment:
+      <<: *sure_env
+    volumes:
+      - app-storage:/rails/storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - sure_net
+
+  db:
+    image: ${SURE_POSTGRES_IMAGE:-postgres:16-local}
+    container_name: siming-sure-db
+    restart: unless-stopped
+    env_file:
+      - ${HOME}/.config/siming/secrets/sure.env
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sure_net
+
+  redis:
+    image: ${SURE_REDIS_IMAGE:-redis:8-local}
+    container_name: siming-sure-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - sure_net
+
+volumes:
+  app-storage:
+  postgres-data:
+  redis-data:
+
+networks:
+  sure_net:
+    driver: bridge

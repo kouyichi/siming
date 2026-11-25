@@ -1,0 +1,7 @@
+name: siming-bridge
+version: 0.2.0
+description: "司命（siming）网关桥接与 QQ 原生内嵌键盘确认框/选择框扩展（clarify / slash_confirm / choice_picker / A2 审批卡按钮）。"
+author: siming
+provides_hooks:
+  - pre_gateway_dispatch
+  - post_gateway_admission
