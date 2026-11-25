@@ -1,6 +1,10 @@
 # Siming 系统架构规格（Architecture）
 
-Siming 是一个**本地优先（Local-First）、事件驱动、确定性优先**的个人助理后台。其核心调度架构吸收了「等待归入数据源（`wait_source`）」「线程订阅直达与完结续接（`Subscription` + `handback`）」「不可变委任状（`Mandate`）」「事务后投递队列（`effects`）」四项核心模式，并将全部计算、数据库与凭据保留在用户本机。
+Siming 是一个**本地优先（Local-First）、事件驱动、确定性优先**的个人助理后台。其核心调度架构融合了「等待归入数据源（`wait_source`）」「线程订阅直达与完结续接（`Subscription` + `handback`）」「不可变委任状（`Mandate`）」「事务后投递队列（`effects`）」四项核心模式，并将全部计算、数据库与凭据保留在用户本机。
+
+<div align="center">
+  <img src="../assets/architecture.svg" alt="Siming 系统总体架构图" width="100%" />
+</div>
 
 ---
 
@@ -39,11 +43,44 @@ Siming 是一个**本地优先（Local-First）、事件驱动、确定性优先
 - **显式登记**：`siming defer add` 直接落库 `WAITING`（默认 TTL 14 天，显式上限 400 天）；
 - **兜底扫描（D-34）**：每 2m 只读扫描本地 Agent 会话新增 `user` 消息，推断出的延后项一律落为 `PROPOSED` 不自动触发，仅在用户确认「记下 Wxx」后转为 `WAITING`（72h 无确认自动 `EXPIRED`）。
 
+### 关键时序：条件唤醒与零模型按钮审批
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User as 用户 / 编码 Agent
+    participant DB as SQLite WAL (siming.db)
+    participant Tick as collectors + evald (2m)
+    participant Worker as worker (Mandate 沙盒)
+    participant Router as router (Night-Owl + Push Guard)
+    participant Chat as QQ / 飞书 (原生按钮)
+
+    User->>DB: siming defer add (写入 waits + 不可变 Mandate)
+    loop 每 2 分钟节拍
+        Tick->>DB: 只读探测 wait_source (time / probe / event)
+    end
+    Tick->>DB: 条件满足 → 同事务写入 effects 队列
+    DB->>Worker: 拉起 worker 并重验 Mandate
+    Worker->>Worker: 隔离 git worktree 修改 + 校验 done_check == 0
+    Worker->>DB: 写入 A2 审批单 (带 TTL 一次性 token)
+    DB->>Router: After-Commit 派发通知
+    Router->>Router: 检查 Night-Owl 作息态 & Push Guard 配额
+    Router->>Chat: 推送单张 A2 确认卡 (附原生按钮)
+    User->>Chat: 点击「批准执行」按钮
+    Chat->>Router: siming inbound-action --stdin-json (零 LLM 介入)
+    Router->>DB: 纯代码校核 OpenID + CAS 消费审批单
+    Router->>User: 确定性执行并写入 audit 回执
+```
+
 ---
 
-## 3. 六层事件链中枢（Event Chain）
+## 3. 六层事件链中枢与三级权限闸门
 
-为解决「孤立单条规则容易误报、缺少上下文联动」的问题，Siming 引入六层结构：
+为解决「孤立单条规则容易误报、缺少上下文联动」以及「模型越权执行」两大核心痛点，Siming 将状态推理收口进六层事件链，并用代码级 A1/A2/A3 权限闸门兜底：
+
+<div align="center">
+  <img src="../assets/event-chain.svg" alt="Siming 六层事件链与三级硬权限闸门" width="100%" />
+</div>
 
 1. **L1 可见度目录（Visibility）**：显式标注每个数据源的可观测性（`high` / `medium` / `delayed` / `blind`），对低可见度领域严禁假装全知地催促「你忘了」。
 2. **L2 人类可读规律库（`routines.md`）**：从历史账本、位置与交互记录中挖掘习惯并写入 `~/.local/share/siming/routines.md`（YAML + Markdown），用户随时可手改或通过聊天暂停某条规律；住址/作息体制变化时自动切入 `relearning` 防止旧规律误报。
