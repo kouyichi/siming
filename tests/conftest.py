@@ -47,6 +47,7 @@ def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> Callable[[str | datetime], 
         "siming.session_scanner",
         "siming.push_guard",
         "siming.install_plan",
+        "siming.self_heal",
         "siming.collectors.buy_track",
         "siming.collectors.omamail_bridge",
     )

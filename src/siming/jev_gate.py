@@ -33,7 +33,7 @@ DEFAULT_JEV_GATE_CONFIG: dict[str, Any] = {
     "enabled": True,
     "model": MODEL,
     "endpoint": ENDPOINT,
-    "timeout_sec": 3.5,
+    "timeout_sec": 0.7,
     "chat_reject_min_prob": 0.92,
     "siming_takeover_min_prob": 0.72,
     "meituan_readonly_rescue_min_prob": 0.78,
@@ -174,6 +174,7 @@ def is_tier0_siming_bypass(
     *,
     reply_to_id: str = "",
     reply_to_text: str = "",
+    reply_to_is_siming: Optional[bool] = None,
     media: Optional[list[str]] = None,
 ) -> tuple[bool, str]:
     """判断消息是否属于 Tier-0 纯代码直通指令（0ms 跳过 JEV，永不因外部 API 故障失效）。"""
@@ -184,7 +185,10 @@ def is_tier0_siming_bypass(
         return False, ""
     if _TIER0_SENSITIVE_RE.search(clean):
         return True, "sensitive_cmd"
-    if reply_to_id or (reply_to_text and _TIER0_QUOTE_MARKER_RE.search(reply_to_text)):
+    # P1 修复：若 FrontDesk 已通过 message_refs 确证被引用消息归属 Hermes 普通聊天（reply_to_is_siming=False），绝不劫持！
+    if reply_to_is_siming is False:
+        pass
+    elif reply_to_is_siming is True or reply_to_id or (reply_to_text and _TIER0_QUOTE_MARKER_RE.search(reply_to_text)):
         return True, "quoted_siming_ctx"
     if _TIER0_EXPLICIT_ID_RE.search(clean):
         return True, "explicit_id"
@@ -329,6 +333,7 @@ def evaluate_siming_takeover(
     *,
     reply_to_id: str = "",
     reply_to_text: str = "",
+    reply_to_is_siming: Optional[bool] = None,
     media: Optional[list[str]] = None,
     policy: Optional[dict[str, Any]] = None,
     policy_path: Optional[Path] = None,
@@ -351,6 +356,7 @@ def evaluate_siming_takeover(
         text,
         reply_to_id=reply_to_id,
         reply_to_text=reply_to_text,
+        reply_to_is_siming=reply_to_is_siming,
         media=media,
     )
     if bypass:
@@ -363,6 +369,21 @@ def evaluate_siming_takeover(
             "model": "",
             "latency_ms": 0,
             "reason": f"tier0:{tag}",
+        }
+
+    # P1 敏感载荷本地隔离：密码/验证码/银行卡/API Key 绝不经任何外部 JEV 分类接口出境
+    from siming.frontdesk import is_sensitive_local_only_payload
+
+    if is_sensitive_local_only_payload(text, reply_to_text):
+        return {
+            "should_siming_handle": True,
+            "verdict": "bypass",
+            "is_meituan": False,
+            "probabilities": {},
+            "confidence": 1.0,
+            "model": "",
+            "latency_ms": 0,
+            "reason": "tier0:sensitive_local_isolation",
         }
 
     clean_msg = (text or "").strip()
@@ -420,7 +441,8 @@ def evaluate_siming_takeover(
 
     model = str(cfg.get("model") or MODEL)
     endpoint = str(cfg.get("endpoint") or ENDPOINT)
-    timeout_sec = max(1.0, min(10.0, float(cfg.get("timeout_sec") or 3.5)))
+    # P1 墙钟预算：前台可选判别默认 700ms，支持 [0.2s, 10.0s] 配置区间
+    timeout_sec = max(0.2, min(10.0, float(cfg.get("timeout_sec") or 0.7)))
     chat_reject_min = float(cfg.get("chat_reject_min_prob") or 0.92)
     siming_min = float(cfg.get("siming_takeover_min_prob") or 0.72)
 

@@ -414,6 +414,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tick.add_argument("--no-collectors", action="store_true")
     p_ew = sub.add_parser("run-effect-worker", help="内部瞬态单元入口：独立执行单条 launch_worker 动作")
     p_ew.add_argument("effect_id")
+    p_ew.add_argument("--expected-gen", type=int, default=0, help="期望 attempt_gen 代次（不匹配即拒绝执行）")
     sub.add_parser("watchdog", help="执行一轮纯脚本看门狗巡检")
     sub.add_parser("edge-sync", help="与公网边缘节点同步心跳、收信队列与预排发件箱")
     p_msync = sub.add_parser("mail-sync", help="立即经 Omamail 只读同步已连接邮箱（163 / Yahoo / Gmail）")
@@ -455,6 +456,10 @@ def _build_parser() -> argparse.ArgumentParser:
     from siming.cli_v5 import register_v5_subcommands
 
     register_v5_subcommands(sub)
+
+    from siming.cli_registry import register_v6_subcommands
+
+    register_v6_subcommands(sub)
 
     return p
 
@@ -1300,7 +1305,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.cmd == "run-effect-worker":
-        res = run_single_effect_worker(db, args.effect_id)
+        res = run_single_effect_worker(db, args.effect_id, expected_gen=int(getattr(args, "expected_gen", 0) or 0))
         print(json.dumps(res, ensure_ascii=False))
         return 0 if res.get("ok") else 1
 
@@ -1436,6 +1441,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     v5_rc = dispatch_v5_command(db, args)
     if v5_rc is not None:
         return v5_rc
+
+    from siming.cli_registry import dispatch_v6_command
+
+    v6_rc = dispatch_v6_command(db, args)
+    if v6_rc is not None:
+        return v6_rc
 
     return 0
 

@@ -465,12 +465,37 @@ def get_health_trends(
         else 0.0,
     }
 
-    # 睡眠债关联统计
+    # 睡眠债关联统计（P3 修复：先按日历日聚合每日最大值，再算真正的连续 >2h 天数，不再拿记录条数冒充天数）
     sleep_series = by_type.get("sleep_debt_h") or []
+    sleep_by_day: dict[str, float] = {}
+    for x in sleep_series:
+        day_k = str(x.get("measured_at") or "")[:10]
+        if not day_k:
+            continue
+        v = float(x["value_num"])
+        if day_k not in sleep_by_day or v > sleep_by_day[day_k]:
+            sleep_by_day[day_k] = v
     sleep_debt_avg = (
-        round(sum(float(x["value_num"]) for x in sleep_series) / len(sleep_series), 2) if sleep_series else 0.0
+        round(sum(sleep_by_day.values()) / len(sleep_by_day), 2) if sleep_by_day else 0.0
     )
-    high_sleep_debt_days = sum(1 for x in sleep_series if float(x["value_num"]) > 2.0)
+    high_days_sorted = sorted(d for d, v in sleep_by_day.items() if v > 2.0)
+    high_sleep_debt_days = 0
+    if high_days_sorted:
+        cur_streak = 1
+        best_streak = 1
+        prev_d = datetime.strptime(high_days_sorted[0], "%Y-%m-%d").date()
+        for d_str in high_days_sorted[1:]:
+            try:
+                cur_d = datetime.strptime(d_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if (cur_d - prev_d).days == 1:
+                cur_streak += 1
+                best_streak = max(best_streak, cur_streak)
+            else:
+                cur_streak = 1
+            prev_d = cur_d
+        high_sleep_debt_days = best_streak
 
     return {
         "ok": True,

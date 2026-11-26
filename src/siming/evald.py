@@ -85,7 +85,9 @@ def _should_detach_worker(db: SimingDB, wait_id: str) -> bool:
     return mode in ("stage", "run", "resume")
 
 
-def _spawn_detached_worker_unit(db: SimingDB, eff_id: str, unit_name: str) -> tuple[bool, str, str]:
+def _spawn_detached_worker_unit(
+    db: SimingDB, eff_id: str, unit_name: str, expected_gen: int = 0
+) -> tuple[bool, str, str]:
     policy = load_policy(db.paths)
     timeout_sec = int(policy["guardrails"].get("worker_timeout_sec", 1800)) + 120
     siming_bin = str(Path.home() / ".local" / "bin" / "siming")
@@ -103,14 +105,18 @@ def _spawn_detached_worker_unit(db: SimingDB, eff_id: str, unit_name: str) -> tu
         "run-effect-worker",
         eff_id,
     ]
+    if expected_gen > 0:
+        cmd.extend(["--expected-gen", str(expected_gen)])
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
     if proc.returncode != 0:
         return False, "", (proc.stderr or proc.stdout).strip()[:240]
     return True, unit_name, ""
 
 
-def run_single_effect_worker(db: SimingDB, effect_id: str) -> dict[str, Any]:
-    """供 systemd-run 瞬态单元调用：按代次（attempt_gen）独立认领并执行 launch_worker，随后冲刷通知。"""
+def run_single_effect_worker(
+    db: SimingDB, effect_id: str, expected_gen: int | None = None
+) -> dict[str, Any]:
+    """供 systemd-run 瞬态单元调用：派发时绑定 expected_gen，按代次 CAS 认领并执行 launch_worker，随后冲刷通知。"""
     db.init_db()
     with db.transaction() as conn:
         row = conn.execute("SELECT * FROM effects WHERE effect_id=?", (effect_id,)).fetchone()
@@ -119,7 +125,10 @@ def run_single_effect_worker(db: SimingDB, effect_id: str) -> dict[str, Any]:
         eff = dict(row)
         if eff["status"] != "RUNNING":
             return {"ok": True, "skipped": eff["status"]}
-        gen = int(eff.get("attempt_gen") or 0)
+        cur_gen = int(eff.get("attempt_gen") or 0)
+        if expected_gen is not None and int(expected_gen) > 0 and cur_gen != int(expected_gen):
+            return {"ok": True, "skipped": f"stale_generation:{expected_gen}!={cur_gen}"}
+        gen = cur_gen
         cur = conn.execute(
             "UPDATE effects SET worker_pid=?, started_at=COALESCE(started_at, ?) WHERE effect_id=? AND status='RUNNING' AND attempt_gen=?",
             (os.getpid(), iso_now(), effect_id, gen),
@@ -249,7 +258,7 @@ def consume_pending_effects(
                 )
                 if cur.rowcount == 0:
                     continue
-            spawn_ok, _, spawn_err = _spawn_detached_worker_unit(db, eff_id, unit_name)
+            spawn_ok, _, spawn_err = _spawn_detached_worker_unit(db, eff_id, unit_name, expected_gen=next_gen)
             if spawn_ok:
                 detached_cnt += 1
                 continue
@@ -342,30 +351,31 @@ def consume_pending_effects(
             if deferred_sec > 0:
                 nxt = iso_now(now_local() + timedelta(seconds=deferred_sec))
                 conn.execute(
-                    "UPDATE effects SET status='PENDING', worker_pid=NULL, next_run_at=?, last_error='paused_deferred' WHERE effect_id=?",
-                    (nxt, eff_id),
+                    "UPDATE effects SET status='PENDING', worker_pid=NULL, next_run_at=?, last_error='paused_deferred' WHERE effect_id=? AND status='RUNNING' AND attempt_gen=?",
+                    (nxt, eff_id, next_gen),
                 )
             elif ok:
-                conn.execute(
-                    "UPDATE effects SET status='DONE', worker_pid=NULL, completed_at=? WHERE effect_id=?",
-                    (fin_ts, eff_id),
+                cur_done = conn.execute(
+                    "UPDATE effects SET status='DONE', worker_pid=NULL, completed_at=? WHERE effect_id=? AND status='RUNNING' AND attempt_gen=?",
+                    (fin_ts, eff_id, next_gen),
                 )
-                done_cnt += 1
+                if cur_done.rowcount > 0:
+                    done_cnt += 1
             else:
                 retries = int(eff["retry_count"]) + 1
                 if retries <= 3:
                     backoff = 60 * (2 ** (retries - 1))
                     nxt = iso_now(now_local() + timedelta(seconds=backoff))
                     conn.execute(
-                        "UPDATE effects SET status='PENDING', retry_count=?, worker_pid=NULL, next_run_at=?, last_error=? WHERE effect_id=?",
-                        (retries, nxt, err[:300], eff_id),
+                        "UPDATE effects SET status='PENDING', retry_count=?, worker_pid=NULL, next_run_at=?, last_error=? WHERE effect_id=? AND status='RUNNING' AND attempt_gen=?",
+                        (retries, nxt, err[:300], eff_id, next_gen),
                     )
                 else:
-                    conn.execute(
-                        "UPDATE effects SET status='FAILED', retry_count=?, worker_pid=NULL, completed_at=?, last_error=? WHERE effect_id=?",
-                        (retries, fin_ts, err[:300], eff_id),
+                    cur_fail = conn.execute(
+                        "UPDATE effects SET status='FAILED', retry_count=?, worker_pid=NULL, completed_at=?, last_error=? WHERE effect_id=? AND status='RUNNING' AND attempt_gen=?",
+                        (retries, fin_ts, err[:300], eff_id, next_gen),
                     )
-                    if kind == "launch_worker":
+                    if cur_fail.rowcount > 0 and kind == "launch_worker":
                         wid = str(payload.get("wait_id") or eff_id)
                         conn.execute(
                             "UPDATE waits SET status='FAILED', result_summary=?, updated_at=? WHERE wait_id=? AND status='FIRED'",
@@ -400,6 +410,16 @@ def run_tick(db: SimingDB, include_collectors: bool = True) -> dict[str, Any]:
     db.init_db()
     policy = load_policy(db.paths)
     now = now_local()
+
+    # P0 系统安全守卫前置：Tesla 18 分钟未发车自动关空调守卫必须在慢采集器之前运行，绝不被拖死
+    p0_tesla_climate: dict[str, Any] = {}
+    if include_collectors:
+        try:
+            from siming.tesla_link import evaluate_departure_auto_climate
+
+            p0_tesla_climate = evaluate_departure_auto_climate(db, departed_now=False, trigger="tick_p0_guard")
+        except Exception as exc:
+            p0_tesla_climate = {"ok": False, "error": str(exc)[:180]}
 
     # 自动清理过期 PENDING 审批单 & 冲刷超过 3 分钟仍未恢复的 Uptime Kuma 真实异常
     expired_approvals = 0
@@ -491,6 +511,14 @@ def run_tick(db: SimingDB, include_collectors: bool = True) -> dict[str, Any]:
             collector_stats["nous_sentinel"] = evaluate_nous_billing_sentinel(db, notify=True)
         except Exception as exc:
             collector_stats["nous_sentinel"] = {"ok": False, "error": str(exc)[:240]}
+
+        try:
+            from siming.gobang_checkin import poll_gobang_checkins
+
+            collector_stats["gobang_checkin"] = poll_gobang_checkins(db, now=now, notify=True)
+        except Exception as exc:
+            db.mark_source_error("gobang_checkin", "ERROR", str(exc)[:240])
+            collector_stats["gobang_checkin"] = {"ok": False, "error": str(exc)[:240]}
         db.mark_source_ok("cn_calendar", detail="local rules active")
 
     try:
@@ -551,10 +579,10 @@ def run_tick(db: SimingDB, include_collectors: bool = True) -> dict[str, Any]:
         except Exception as exc:
             spatial_res = {"ok": False, "error": str(exc)[:240]}
 
-        # 司命 v5（Wave 1–4）节拍守卫：每 30m / 6h 节流巡检，严格独立异常隔离且受模块开关控制
+        # 司命 v5（Wave 1–4）节拍守卫：每 30m / 6h 节流巡检，接入 D-35(D1-A) 三维能力生命周期 is_module_tick_active（未到位硬件自动停空转）
         v5_guards: dict[str, Any] = {}
         try:
-            from siming.modules import is_module_enabled
+            from siming.modules import is_module_tick_active as is_module_enabled
 
             last_v5_30m = db.get_meta("last_v5_30m_guard_at")
             if not last_v5_30m or (now - parse_iso(last_v5_30m)).total_seconds() >= 1800:

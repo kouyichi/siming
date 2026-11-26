@@ -1596,9 +1596,21 @@ def _run_hermes_confidential_payment_handoff(
         ctx_file.unlink(missing_ok=True)
         combined_file.unlink(missing_ok=True)
 
-    # 绝不盲信模型文本输出：必须由纯代码重新核验收银台标签页与订单列表真实状态！
+    # 绝不盲信模型文本输出：必须由纯代码重新核验收银台标签页与订单列表真实状态（按原 order_id 精确核验，不误匹配同店历史单）！
     post_snap = snap_fn(tid, port) if tid else {"ok": False}
     post_olist = olist_fn(shop, order_id, port)
+    try:
+        db.record_model_call(
+            provider=str(cfg.get("provider") or "redpill"),
+            model=str(used_model or cfg.get("model") or ""),
+            purpose="meituan_pay_handoff",
+            source="cli_receipt",
+            status="ok" if hermes_rc == 0 else ("timeout" if timed_out else f"rc_{hermes_rc}"),
+            ref_id=order_id or tid,
+            meta={"attempted_models": attempted_models},
+        )
+    except Exception:
+        pass
 
     if post_snap.get("has_captcha") or post_snap.get("has_hard_2fa"):
         return {
@@ -1616,7 +1628,8 @@ def _run_hermes_confidential_payment_handoff(
         }
 
     is_paid_cashier = bool(post_snap.get("paid"))
-    is_paid_olist = bool(post_olist.get("found") and post_olist.get("paid"))
+    oid_matched = (not order_id) or (post_olist.get("order_id_matched") is not False)
+    is_paid_olist = bool(post_olist.get("found") and post_olist.get("paid") and oid_matched)
     if is_paid_cashier or is_paid_olist:
         paid_yuan = verified_yuan
         snap_amt = post_snap.get("payable_yuan")
@@ -2168,43 +2181,113 @@ def execute_meituan_submit_pay(
     params: dict[str, Any],
     db: SimingDB,
     cdp_pay_fn: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
+    approval_token: str = "",
 ) -> str:
-    """纯代码审批 `meituan_submit_pay` 执行器：校验幂等防重付、执行提交与美团收银台付款并返回真实回执。"""
+    """纯代码审批 `meituan_submit_pay` 执行器（P0 意图幂等 + 三态收据 + 保留 D4 当前支付调用方式）：
+    - 用事务级 PaymentIntent 绑定本次购买意图（approval_token 或 preview_target_id/quote_version）：
+      同一张确认卡重复点击绝不二次扣款；同店重新生成的第二单则拥有独立意图，正常放行！
+    - 在发出提交前落盘 SUBMITTING，异常/未确认扣款转入 RECONCILING / NEEDS_USER_ACTION，绝不盲目重提交。
+    """
+    from siming.receipts import (
+        ActionResult,
+        ReceiptSummary,
+        build_intent_idempotency_key,
+        create_or_get_intent,
+        record_receipt_stage,
+    )
+
+    db.init_db()
     shop = str(params.get("shop") or "").strip()
     item_spec = str(params.get("item_spec") or "").strip()
     deeplink = str(params.get("deeplink") or f"imeituan://www.meituan.com/waimai/search?query={urllib.parse.quote(shop)}")
     orders_deeplink = "imeituan://www.meituan.com/waimai/orders"
+    clean_tok = (approval_token or str(params.get("__approval_token__") or "")).strip().upper()
 
-    # 幂等防重复支付锁
-    pay_digest = hashlib.sha256(
-        json.dumps(
-            {
-                "shop": shop,
-                "item_spec": item_spec,
-                "final_payable_yuan": params.get("final_payable_yuan"),
-                "preview_target_id": params.get("preview_target_id"),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()[:24]
-    if (db.get_meta("last_meituan_paid_digest") or "").strip() == pay_digest:
+    idem_key = build_intent_idempotency_key(
+        "meituan_submit_pay",
+        approval_token=clean_tok,
+        target_id=shop,
+        params=params,
+    )
+    # 同一 preview_target_id（同一浏览器结算页）无论是否带 approval_token 再次直调，一律触发防重付拦截；
+    # 同店重新发起的第二单拥有全新的 preview_target_id 与 approval_token，可正常放行！
+    preview_tid = str(params.get("preview_target_id") or "").strip()
+    if preview_tid:
+        conn_chk = db.connect()
+        try:
+            prior_rows = conn_chk.execute(
+                """
+                SELECT intent_id, state, quote_json FROM action_intents
+                WHERE action='meituan_submit_pay'
+                  AND state IN ('SUBMITTING', 'PAYING', 'RECONCILING', 'PAID_VERIFIED', 'NEEDS_USER_ACTION')
+                ORDER BY created_at DESC LIMIT 30
+                """
+            ).fetchall()
+            for pr in prior_rows:
+                try:
+                    q_old = json.loads(str(pr["quote_json"] or "{}"))
+                except Exception:
+                    q_old = {}
+                if str(q_old.get("preview_target_id") or "").strip() == preview_tid and (
+                    not shop or str(q_old.get("shop") or "").strip() == shop
+                ):
+                    raise RuntimeError("该笔订单已执行过支付提交，已触发防重复扣款拦截。")
+        finally:
+            conn_chk.close()
+
+    amt_c = int(round(float(params.get("final_payable_yuan") or 0.0) * 100))
+    max_c = int(round(float(params.get("max_authorized_yuan") or params.get("final_payable_yuan") or 0.0) * 100))
+    intent, created_new = create_or_get_intent(
+        db,
+        action="meituan_submit_pay",
+        idempotency_key=idem_key,
+        approval_token=clean_tok,
+        target_id=shop,
+        amount_cents=amt_c,
+        max_authorized_cents=max_c,
+        quote={
+            "shop": shop,
+            "item_spec": item_spec,
+            "final_payable_yuan": params.get("final_payable_yuan"),
+            "preview_target_id": params.get("preview_target_id"),
+            "delivery_address": params.get("delivery_address") or "",
+        },
+        initial_state="SUBMITTING",
+    )
+    if not created_new and str(intent.get("state") or "") in (
+        "SUBMITTING",
+        "PAYING",
+        "RECONCILING",
+        "PAID_VERIFIED",
+        "NEEDS_USER_ACTION",
+    ):
         raise RuntimeError("该笔订单已执行过支付提交，已触发防重复扣款拦截。")
+
+    record_receipt_stage(
+        db,
+        intent_id=intent["intent_id"],
+        stage="submitting",
+        approval_token=clean_tok,
+        ok=True,
+        summary=f"开始提交美团订单：{shop}（{item_spec}）",
+        new_intent_state="SUBMITTING",
+    )
 
     res = cdp_pay_fn(params) if cdp_pay_fn is not None else _live_submit_and_pay_meituan_order(params, db)
     db.set_meta("last_meituan_order_at", iso_now())
+    ext_oid = str(res.get("order_id") or "").strip()
 
     if res.get("ok") and res.get("paid"):
-        db.set_meta("last_meituan_paid_digest", pay_digest)
         db.set_meta(
             "last_meituan_paid_order",
             json.dumps(
                 {
                     "paid_at": iso_now(),
+                    "intent_id": intent["intent_id"],
                     "shop": res.get("shop") or shop,
                     "item_spec": item_spec,
                     "paid_yuan": res.get("paid_yuan") or params.get("final_payable_yuan"),
-                    "order_id": res.get("order_id") or "",
+                    "order_id": ext_oid,
                     "delivery_address": res.get("delivery_address") or params.get("delivery_address") or "",
                 },
                 ensure_ascii=False,
@@ -2216,37 +2299,180 @@ def execute_meituan_submit_pay(
         pay_s = f"¥{float(paid_yuan):g}" if paid_yuan is not None else "见账单"
         addr_s = str(res.get("delivery_address") or params.get("delivery_address") or "").strip()
         eta_s = str(res.get("eta_text") or params.get("eta_text") or "").strip()
-        oid_s = f" · 订单号 `{res['order_id']}`" if res.get("order_id") else ""
+        oid_s = f" · 订单号 `{ext_oid}`" if ext_oid else ""
         st_s = f" · 状态：{res['order_status']}" if res.get("order_status") else ""
-        parts = [f"🎉 **美团外卖已下单并支付成功！**"]
+        parts = ["🎉 **美团外卖已下单并支付成功！**"]
         parts.append(f"• 门店：**{res.get('shop') or shop}** — `{item_spec}`")
         ch_s = "（经 Hermes 机密通道支付）" if res.get("pay_channel") == "hermes_confidential_handoff" else ""
         parts.append(f"• 实付：**{pay_s}**{ch_s}{oid_s}{st_s}")
         if addr_s:
             parts.append(f"• 配送：**{addr_s}**" + (f"（{eta_s}）" if eta_s else ""))
-        return "\n".join(parts)
+        summary_txt = "\n".join(parts)
+        record_receipt_stage(
+            db,
+            intent_id=intent["intent_id"],
+            stage="paid_verified",
+            approval_token=clean_tok,
+            ok=True,
+            external_ref=ext_oid,
+            evidence={
+                "shop": res.get("shop") or shop,
+                "paid_yuan": paid_yuan,
+                "order_status": res.get("order_status") or "",
+                "pay_channel": res.get("pay_channel") or "cdp_direct",
+            },
+            summary=summary_txt,
+            new_intent_state="PAID_VERIFIED",
+        )
+        return ReceiptSummary(
+            summary_txt,
+            ActionResult(
+                outcome="paid_verified",
+                summary=summary_txt,
+                external_order_id=ext_oid,
+                authorization_consumed=True,
+                order_submitted=True,
+                external_verified=True,
+                paid_verified=True,
+                evidence={"intent_id": intent["intent_id"], "paid_yuan": paid_yuan, "shop": res.get("shop") or shop},
+            ),
+        )
 
     if res.get("needs_user_action"):
-        db.set_meta("last_meituan_paid_digest", pay_digest)
         reason = str(res.get("reason") or "需本人确认付款")
         c_url = str(res.get("cashier_url") or "").strip()
-        oid_line = f"\n• 订单号：`{res['order_id']}`" if res.get("order_id") else ""
+        oid_line = f"\n• 订单号：`{ext_oid}`" if ext_oid else ""
         url_line = f"\n• 收银台直达：{c_url}" if c_url.startswith("http") else ""
-        return (
+        is_reconciling = str(res.get("state") or "").upper() == "RECONCILING"
+        summary_txt = (
             f"⏳ **订单已提交，等待你完成最终支付验证**（**{shop}** · 应付 ¥{res.get('payable_yuan') or params.get('final_payable_yuan')}）\n"
             f"• 原因：{reason}{oid_line}{url_line}\n"
             f"• 已原样保留桌面 Chromium 后台标签页；也可在手机美团「待付款」直接一键付款：{orders_deeplink}"
         )
+        record_receipt_stage(
+            db,
+            intent_id=intent["intent_id"],
+            stage="needs_user_action",
+            approval_token=clean_tok,
+            ok=True,
+            external_ref=ext_oid,
+            evidence={"state": res.get("state") or "NEEDS_USER_ACTION", "reason": reason, "cashier_url": c_url},
+            summary=summary_txt,
+            new_intent_state="RECONCILING" if is_reconciling else "NEEDS_USER_ACTION",
+        )
+        return ReceiptSummary(
+            summary_txt,
+            ActionResult(
+                outcome="submitted_pending" if is_reconciling else "needs_user_action",
+                summary=summary_txt,
+                external_order_id=ext_oid,
+                authorization_consumed=True,
+                order_submitted=bool(res.get("order_submitted", True)),
+                external_verified=False,
+                paid_verified=False,
+                evidence={"intent_id": intent["intent_id"], "state": res.get("state") or "NEEDS_USER_ACTION"},
+            ),
+        )
 
     if res.get("gated"):
-        return (
+        summary_txt = (
             f"🛡️ 提交支付触发美团安全门禁（{res.get('reason') or '需验证'}），已按安全红线停手并保留桌面标签页（未扣款），"
             f"处理完成后可重新下单或直接点美团唤端：{deeplink}"
         )
+        record_receipt_stage(
+            db,
+            intent_id=intent["intent_id"],
+            stage="needs_user_action",
+            approval_token=clean_tok,
+            ok=True,
+            external_ref=ext_oid,
+            evidence={"gated": True, "reason": res.get("reason") or ""},
+            summary=summary_txt,
+            new_intent_state="NEEDS_USER_ACTION",
+        )
+        return ReceiptSummary(
+            summary_txt,
+            ActionResult(
+                outcome="needs_user_action",
+                summary=summary_txt,
+                external_order_id=ext_oid,
+                authorization_consumed=True,
+                order_submitted=False,
+                external_verified=False,
+                paid_verified=False,
+                evidence={"intent_id": intent["intent_id"], "gated": True},
+            ),
+        )
 
     if res.get("order_submitted"):
-        db.set_meta("last_meituan_paid_digest", pay_digest)
+        record_receipt_stage(
+            db,
+            intent_id=intent["intent_id"],
+            stage="order_submitted",
+            approval_token=clean_tok,
+            ok=False,
+            external_ref=ext_oid,
+            error=str(res.get("error") or res.get("reason") or "支付状态待对账"),
+            new_intent_state="RECONCILING",
+        )
+    else:
+        record_receipt_stage(
+            db,
+            intent_id=intent["intent_id"],
+            stage="failed",
+            approval_token=clean_tok,
+            ok=False,
+            error=str(res.get("error") or res.get("reason") or "支付未完成"),
+            new_intent_state="FAILED",
+        )
     raise RuntimeError(str(res.get("error") or res.get("reason") or "支付未完成"))
+
+
+def reconcile_payment_intent(
+    db: SimingDB,
+    intent_id: str,
+    *,
+    verify_olist_fn: Optional[Callable[[str, str, int], dict[str, Any]]] = None,
+    port: int = 9222,
+) -> dict[str, Any]:
+    """对账处于 RECONCILING / SUBMITTING / NEEDS_USER_ACTION 的支付意图：
+    只核验原平台订单号与支付结果，严禁自动重新提交订单或重新输密码。
+    """
+    from siming.receipts import get_intent_with_receipts, record_receipt_stage
+
+    db.init_db()
+    intent = get_intent_with_receipts(db, intent_id=intent_id)
+    if not intent:
+        return {"ok": False, "error": f"未找到支付意图 {intent_id}"}
+    if intent["state"] == "PAID_VERIFIED":
+        return {"ok": True, "state": "PAID_VERIFIED", "paid_verified": True, "intent": intent}
+
+    quote = json.loads(intent.get("quote_json") or "{}")
+    shop = str(quote.get("shop") or intent.get("target_id") or "")
+    order_id = str(intent.get("external_order_id") or "")
+    vfn = verify_olist_fn or (lambda s, oid, p: cdp_verify_olist_paid(s, order_id=oid, port=p))
+    check = vfn(shop, order_id, port)
+    oid_ok = (not order_id) or (check.get("order_id_matched") is not False)
+    if check.get("found") and check.get("paid") and oid_ok:
+        record_receipt_stage(
+            db,
+            intent_id=intent_id,
+            stage="paid_verified",
+            approval_token=str(intent.get("approval_token") or ""),
+            ok=True,
+            external_ref=order_id,
+            evidence={"reconciled": True, **check},
+            summary=f"对账核验已支付（{shop} {order_id}）",
+            new_intent_state="PAID_VERIFIED",
+        )
+        return {"ok": True, "state": "PAID_VERIFIED", "paid_verified": True, "check": check}
+    return {
+        "ok": True,
+        "state": str(intent.get("state") or "RECONCILING"),
+        "paid_verified": False,
+        "reason": "order_id_mismatch" if not oid_ok else str(check.get("reason") or "not_yet_verified"),
+        "check": check,
+    }
 
 
 def cancel_meituan_pending_order(

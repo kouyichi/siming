@@ -293,6 +293,13 @@ async def _deliver_inbound_result_to_qq(
         await _QQ_INTERACTIVE._send_plain_no_auto_kb(
             adapter, chat_id, "⚠️ 该敏感口令未匹配当前待处理状态，已拦截且未转交对话模型。"
         )
+        return
+    # P1 修复 8s 接管失忆：若后台异步任务最终返回 handled=False，明确交还并告知用户，绝不黑洞吞没！
+    await _QQ_INTERACTIVE._send_plain_no_auto_kb(
+        adapter,
+        chat_id,
+        "↩️ 司命检查后确认该消息属于普通对话/未命中专项单据，已交还 Hermes（如仍需继续讨论可直接回复，不会丢失上下文）。",
+    )
 
 
 async def _await_and_deliver_bg(
@@ -371,9 +378,14 @@ async def _on_post_gateway_admission(**kwargs: Any) -> Optional[dict[str, Any]]:
         isinstance(jev_decision, dict) and jev_decision.get("is_meituan")
     )
 
-    # 改用 stdin JSON 传递入站载荷：彻底阻断 `ps aux` 暴露解压码/消息正文，并避免 `-` 开头消息触发 argparse 吞参！
+    # 改用 stdin JSON 传递入站载荷：彻底阻断 `ps aux` 暴露解压码/消息正文，并透传消息信封供 FrontDesk 持久化 owner/reply_epoch
+    source = kwargs.get("source") if isinstance(kwargs.get("source"), dict) else {}
+    chat_id = str(source.get("chat_id") or "")
     payload_obj: dict[str, Any] = {
         "text": clean_text,
+        "message_id": msg_id,
+        "channel": platform,
+        "conversation": chat_id,
         "reply_to_id": reply_to_id,
         "reply_to_text": effective_reply_to_text,
         "media": local_media,
@@ -384,8 +396,6 @@ async def _on_post_gateway_admission(**kwargs: Any) -> Optional[dict[str, Any]]:
 
     inbound_timeout = 300.0 if (is_sensitive_cmd or is_long_cmd) else 60.0
     adapter = _QQ_INTERACTIVE.get_active_qq_adapter() if (platform == "qqbot" and _QQ_INTERACTIVE is not None) else None
-    source = kwargs.get("source") if isinstance(kwargs.get("source"), dict) else {}
-    chat_id = str(source.get("chat_id") or "")
     can_bg_qq = bool(platform == "qqbot" and adapter is not None and chat_id and _QQ_INTERACTIVE is not None)
 
     cli_task = asyncio.create_task(
@@ -395,14 +405,16 @@ async def _on_post_gateway_admission(**kwargs: Any) -> Optional[dict[str, Any]]:
         try:
             rc, out = await asyncio.wait_for(asyncio.shield(cli_task), timeout=_HOOK_SYNC_WAIT_SEC)
         except asyncio.TimeoutError:
-            # 超过 8s 仍在运行的必然是司命实时执行（加购/核验/自动支付）；立即向 QQ 告知进度并抢在网关 30s 钩子限时前返回 handled，
-            # 由后台任务在最长 300s 内完成后直接推送带原生按钮的最终确认卡或支付回执！
-            if is_sensitive_cmd:
-                progress_txt = "⏳ 已收到确认指令，正在后台提交美团订单并执行自动扣款，完成后立即推送实单回执，请稍候…"
+            # P1 修复：按实际命令类型给出诚实受理回执（不再把广义敏感口令错印成「正在提交美团订单」）
+            is_pay_hint = bool(re.search(r"(?:确认支付|确认付款|去支付|立即支付|美团|点餐|外卖)", norm_text))
+            if is_sensitive_cmd and is_pay_hint:
+                progress_txt = "⏳ 已收到付款确认指令，正在后台提交订单并核验三态收据，完成后立即推送回执，请稍候…"
+            elif is_sensitive_cmd:
+                progress_txt = "⏳ 已收到司命确认/控制指令，正在后台执行并核验收据，完成后立即推送回执，请稍候…"
             elif is_long_cmd:
-                progress_txt = "⏳ 正在后台为你实时加购并核验美团结算页（自动补齐必选品、核对地址与匹配红包），完成后立即推送确认按钮，请稍候…"
+                progress_txt = "⏳ 正在后台为你实时加购并核验优惠，稍后直接弹出付款确认按钮，请稍候…"
             else:
-                progress_txt = "⏳ 司命正在后台处理中，完成后立即推送结果，请稍候…"
+                progress_txt = "⏳ 司命正在后台处理中，完成后立即推送结果（如不属司命单据将明确交还 Hermes），请稍候…"
             try:
                 await _QQ_INTERACTIVE._send_plain_no_auto_kb(adapter, chat_id, progress_txt)
             except Exception:

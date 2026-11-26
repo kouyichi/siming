@@ -116,20 +116,25 @@ def collect_douyin_orders(db: SimingDB, force: bool = False, port: int = 9222) -
             except Exception:
                 pass
 
-    favs = extract_tech_bookmarks_from_douyin_favorites(body_txt)
-    added = 0
-    conn = db.connect()
-    try:
-        existing_titles = {str(r["title"]) for r in conn.execute("SELECT title FROM bookmarks").fetchall()}
-    finally:
-        conn.close()
+    from siming.bookmark_recall import enrich_unclassified_bookmarks, extract_all_bookmarks_from_douyin_favorites, save_lossless_bookmark
 
+    # P3(#6) 修复：入库前不再按技术/家居关键词误删餐厅/食谱/好物，先无损入库再后台提取实体
+    favs = extract_all_bookmarks_from_douyin_favorites(body_txt)
+    added = 0
     for f in favs:
-        if f["title"] in existing_titles:
-            continue
-        save_bookmark_from_drop(db, f["body"], title_override=f["title"])
-        existing_titles.add(f["title"])
-        added += 1
+        s_res = save_lossless_bookmark(
+            db,
+            title=f["title"],
+            body=f["body"],
+            platform=f["platform"],
+            platform_item_id=f["platform_item_id"],
+            canonical_url=f["canonical_url"],
+            classify_now=False,
+        )
+        if s_res.get("ok") and not s_res.get("duplicate"):
+            added += 1
+    if added > 0:
+        enrich_unclassified_bookmarks(db, limit=added + 20)
 
     db.mark_source_ok("douyin_orders", detail=f"web_favs_scanned={len(favs)} new_bookmarks={added}")
     return {"ok": True, "favs_matched": len(favs), "bookmarks_added": added}

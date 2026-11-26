@@ -85,6 +85,10 @@ def pid_is_siming_process(pid: Optional[int], expected_boot_id: str = "") -> boo
     return True
 
 
+SCHEMA_VERSION = 62
+_INITIALIZED_DBS: dict[str, tuple[int, int]] = {}
+
+
 class SimingDB:
     def __init__(self, paths: Optional[SimingPaths] = None) -> None:
         self.paths = bootstrap_config(paths or get_paths())
@@ -97,6 +101,17 @@ class SimingDB:
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = NORMAL;")
         conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA busy_timeout = 15000;")
+        return conn
+
+    def connect_readonly(self) -> sqlite3.Connection:
+        """只读投影连接：不拿独占写锁、不跑 DDL，供控制塔/查询视图使用（库不存在时自动初始化一次）。"""
+        if not self.db_path.exists():
+            self.init_db()
+        uri = f"file:{self.db_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=15.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON;")
         conn.execute("PRAGMA busy_timeout = 15000;")
         return conn
 
@@ -127,35 +142,75 @@ class SimingDB:
             if "duplicate column name" not in str(exc).lower():
                 raise
 
-    def init_db(self) -> None:
-        schema = _schema_sql_path(self.paths).read_text(encoding="utf-8")
+    def init_db(self, *, force: bool = False) -> None:
+        """按 schema_version 幂等初始化与迁移；同进程内对已迁移且未重建的 DB 走零锁快路径，避免 237 处调用争写锁。"""
         self.paths.ensure_dirs()
+        db_key = str(self.db_path.resolve())
+        if not force and self.db_path.exists():
+            try:
+                st = self.db_path.stat()
+                cached = _INITIALIZED_DBS.get(db_key)
+                if cached == (st.st_ino, SCHEMA_VERSION):
+                    return
+            except OSError:
+                pass
+
+        schema = _schema_sql_path(self.paths).read_text(encoding="utf-8")
         lock_path = self.paths.data_dir / ".db_init.lock"
         with lock_path.open("a+", encoding="utf-8") as lock_fh:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
             try:
                 conn = self.connect()
                 try:
-                    conn.executescript(schema)
-                    # 幂等迁移已有库新增列（文件锁 + duplicate column 双重防并发竞态）
-                    self._ensure_column(conn, "effects", "unit_name", "TEXT NOT NULL DEFAULT ''")
-                    self._ensure_column(conn, "effects", "attempt_gen", "INTEGER NOT NULL DEFAULT 0")
+                    cur_ver = int(conn.execute("PRAGMA user_version;").fetchone()[0] or 0)
+                    if force or cur_ver < SCHEMA_VERSION:
+                        conn.executescript(schema)
+                        # 幂等迁移已有库新增列（文件锁 + duplicate column 双重防并发竞态）
+                        self._ensure_column(conn, "effects", "unit_name", "TEXT NOT NULL DEFAULT ''")
+                        self._ensure_column(conn, "effects", "attempt_gen", "INTEGER NOT NULL DEFAULT 0")
 
-                    self._ensure_column(conn, "approvals", "bundle_id", "TEXT NOT NULL DEFAULT ''")
-                    self._ensure_column(conn, "approvals", "claimed_at", "TEXT")
-                    self._ensure_column(conn, "approvals", "claimer_pid", "INTEGER")
-                    self._ensure_column(conn, "approvals", "claimer_boot_id", "TEXT NOT NULL DEFAULT ''")
+                        self._ensure_column(conn, "approvals", "bundle_id", "TEXT NOT NULL DEFAULT ''")
+                        self._ensure_column(conn, "approvals", "claimed_at", "TEXT")
+                        self._ensure_column(conn, "approvals", "claimer_pid", "INTEGER")
+                        self._ensure_column(conn, "approvals", "claimer_boot_id", "TEXT NOT NULL DEFAULT ''")
+                        self._ensure_column(conn, "approvals", "intent_id", "TEXT NOT NULL DEFAULT ''")
+                        self._ensure_column(conn, "approvals", "receipt_stage", "TEXT NOT NULL DEFAULT ''")
 
-                    self._ensure_column(conn, "task_runs", "wrapper_pid", "INTEGER")
-                    self._ensure_column(conn, "task_runs", "boot_id", "TEXT NOT NULL DEFAULT ''")
-                    self._ensure_column(conn, "task_runs", "blocked_notified_seq", "INTEGER NOT NULL DEFAULT -1")
+                        self._ensure_column(conn, "task_runs", "wrapper_pid", "INTEGER")
+                        self._ensure_column(conn, "task_runs", "boot_id", "TEXT NOT NULL DEFAULT ''")
+                        self._ensure_column(conn, "task_runs", "blocked_notified_seq", "INTEGER NOT NULL DEFAULT -1")
 
-                    self._ensure_column(conn, "subscription_audit", "is_ongoing", "INTEGER NOT NULL DEFAULT 1")
-                    self._ensure_column(conn, "subscription_audit", "ongoing_source", "TEXT NOT NULL DEFAULT 'AUTO'")
+                        self._ensure_column(conn, "subscription_audit", "is_ongoing", "INTEGER NOT NULL DEFAULT 1")
+                        self._ensure_column(conn, "subscription_audit", "ongoing_source", "TEXT NOT NULL DEFAULT 'AUTO'")
 
-                    if self.db_path.exists():
-                        os.chmod(self.db_path, 0o600)
-                    self._seed_defaults(conn)
+                        # v6.2 列迁移：outbox 受理/送达状态与版本、usage 源头实测记账、bookmarks 无损平台字段
+                        self._ensure_column(conn, "outbox", "delivery_state", "TEXT NOT NULL DEFAULT ''")
+                        self._ensure_column(conn, "outbox", "version", "INTEGER NOT NULL DEFAULT 1")
+
+                        self._ensure_column(conn, "usage", "call_id", "TEXT NOT NULL DEFAULT ''")
+                        self._ensure_column(conn, "usage", "run_id", "TEXT NOT NULL DEFAULT ''")
+                        self._ensure_column(conn, "usage", "provider", "TEXT NOT NULL DEFAULT ''")
+                        self._ensure_column(conn, "usage", "cached_tokens", "INTEGER NOT NULL DEFAULT 0")
+                        self._ensure_column(conn, "usage", "meter_source", "TEXT NOT NULL DEFAULT 'estimated'")
+                        self._ensure_column(conn, "usage", "latency_ms", "INTEGER NOT NULL DEFAULT 0")
+                        self._ensure_column(conn, "usage", "outcome", "TEXT NOT NULL DEFAULT 'ok'")
+                        self._ensure_column(conn, "usage", "billing_kind", "TEXT NOT NULL DEFAULT 'subscription'")
+
+                        self._ensure_column(conn, "bookmarks", "platform", "TEXT NOT NULL DEFAULT 'unknown'")
+                        self._ensure_column(conn, "bookmarks", "platform_item_id", "TEXT NOT NULL DEFAULT ''")
+                        self._ensure_column(conn, "bookmarks", "canonical_url", "TEXT NOT NULL DEFAULT ''")
+                        self._ensure_column(conn, "bookmarks", "entity_json", "TEXT NOT NULL DEFAULT '{}'")
+                        self._ensure_column(conn, "bookmarks", "classification_state", "TEXT NOT NULL DEFAULT 'classified'")
+
+                        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
+                        if self.db_path.exists():
+                            os.chmod(self.db_path, 0o600)
+                        self._seed_defaults(conn)
+                    try:
+                        st = self.db_path.stat()
+                        _INITIALIZED_DBS[db_key] = (st.st_ino, SCHEMA_VERSION)
+                    except OSError:
+                        pass
                 finally:
                     conn.close()
             finally:
@@ -373,6 +428,32 @@ class SimingDB:
                 (source_id, new_cursor, effective_ok_at, ts, last_used, redact_sensitive(detail, self.paths)),
             )
 
+    def record_usage_event(
+        self,
+        feature_id: str,
+        action: str,
+        actor: str = "system",
+        ref_id: str = "",
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        """记录带真实归因（human / system_receipt / system_trigger / user_accept）的特性使用事件。"""
+        ts = iso_now()
+        clean_actor = str(actor or "system").strip()[:32]
+
+        def _write(c: sqlite3.Connection) -> None:
+            c.execute(
+                "INSERT INTO feature_usage (feature_id, actor, action, ref_id, ts) VALUES (?, ?, ?, ?, ?)",
+                (feature_id, clean_actor, action, ref_id, ts),
+            )
+            if clean_actor == "human":
+                c.execute("UPDATE sources SET last_used_at = ? WHERE id = ?", (ts, feature_id))
+
+        if conn is not None:
+            _write(conn)
+        else:
+            with self.transaction() as c:
+                _write(c)
+
     def record_human_use(
         self,
         feature_id: str,
@@ -380,21 +461,65 @@ class SimingDB:
         ref_id: str = "",
         conn: Optional[sqlite3.Connection] = None,
     ) -> None:
-        """记录本人真实交互行为（用于 30 天无真实使用自动冻结统计，严禁由后台采集器调用）。"""
-        ts = iso_now()
+        """记录本人真实交互行为（严禁由后台采集器或远端自动回执调用）。"""
+        self.record_usage_event(feature_id, action, actor="human", ref_id=ref_id, conn=conn)
 
-        def _write(c: sqlite3.Connection) -> None:
+    def record_model_call(
+        self,
+        *,
+        model: str,
+        provider: str = "",
+        runner: str = "coding_plan",
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+        cached_tokens: int = 0,
+        cost_cny: float = 0.0,
+        meter_source: str = "estimated",
+        latency_ms: int = 0,
+        outcome: str = "ok",
+        billing_kind: str = "subscription",
+        run_id: str = "",
+        ref_id: str = "",
+        call_id: str = "",
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> str:
+        """统一从调用源头记录 ModelCall（区分 provider_usage / cli_receipt / estimated / unknown，以及 subscription / cash）。"""
+        ts = iso_now()
+        cid = call_id.strip() or f"MC-{now_local().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}"
+
+        def _insert(c: sqlite3.Connection) -> None:
             c.execute(
-                "INSERT INTO feature_usage (feature_id, actor, action, ref_id, ts) VALUES (?, 'human', ?, ?, ?)",
-                (feature_id, action, ref_id, ts),
+                """
+                INSERT INTO usage (
+                    ts, model, runner, tokens_in, tokens_out, cost_cny, ref_id,
+                    call_id, run_id, provider, cached_tokens, meter_source, latency_ms, outcome, billing_kind
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts,
+                    str(model or "unknown")[:120],
+                    str(runner or "coding_plan")[:64],
+                    max(0, int(tokens_in)),
+                    max(0, int(tokens_out)),
+                    float(cost_cny or 0.0),
+                    str(ref_id or "")[:80],
+                    cid,
+                    str(run_id or "")[:64],
+                    str(provider or "")[:64],
+                    max(0, int(cached_tokens)),
+                    str(meter_source or "estimated")[:32],
+                    max(0, int(latency_ms)),
+                    str(outcome or "ok")[:32],
+                    str(billing_kind or "subscription")[:24],
+                ),
             )
-            c.execute("UPDATE sources SET last_used_at = ? WHERE id = ?", (ts, feature_id))
 
         if conn is not None:
-            _write(conn)
+            _insert(conn)
         else:
             with self.transaction() as c:
-                _write(c)
+                _insert(c)
+        return cid
 
     def record_usage(
         self,
@@ -406,23 +531,18 @@ class SimingDB:
         ref_id: str = "",
         conn: Optional[sqlite3.Connection] = None,
     ) -> None:
-        """统一记录司命后台 LLM / 机密通道调用量与成本，驱动周日健康自省报告。"""
-        ts = iso_now()
-
-        def _insert(c: sqlite3.Connection) -> None:
-            c.execute(
-                """
-                INSERT INTO usage (ts, model, runner, tokens_in, tokens_out, cost_cny, ref_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (ts, str(model or "unknown")[:120], str(runner or "coding_plan")[:64], max(0, int(tokens_in)), max(0, int(tokens_out)), float(cost_cny or 0.0), str(ref_id or "")[:80]),
-            )
-
-        if conn is not None:
-            _insert(conn)
-        else:
-            with self.transaction() as c:
-                _insert(c)
+        """兼容旧调用方，自动委托给源头 ModelCall 计量。"""
+        self.record_model_call(
+            model=model,
+            runner=runner,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_cny=cost_cny,
+            meter_source="estimated",
+            billing_kind="cash" if float(cost_cny or 0.0) > 0 else "subscription",
+            ref_id=ref_id,
+            conn=conn,
+        )
 
     def mark_source_error(self, source_id: str, auth_state: str, detail: str) -> None:
         ts = iso_now()

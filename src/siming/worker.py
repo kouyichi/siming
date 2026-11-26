@@ -433,7 +433,8 @@ def _execute_resume_herdr(
         encoding="utf-8",
     )
 
-    resumed_cmd_desc = "已打开目录后台标签"
+    resumed_cmd_desc = "目录已准备（已写入现场交接说明）"
+    resume_verified = False
     if new_pane_id and new_pane_id not in before_panes and mandate.session_id:
         if mandate.agent == "claude":
             run_args = [
@@ -446,8 +447,12 @@ def _execute_resume_herdr(
                 mandate.session_id,
                 "--fork-session",
             ]
-            subprocess.run(run_args, capture_output=True, text=True, timeout=8)
-            resumed_cmd_desc = f"claude --resume {mandate.session_id} --fork-session"
+            p_run = subprocess.run(run_args, capture_output=True, text=True, timeout=8)
+            if p_run.returncode == 0:
+                resumed_cmd_desc = f"claude --resume {mandate.session_id} --fork-session"
+                resume_verified = True
+            else:
+                resumed_cmd_desc = f"目录已就绪（claude resume 注入失败 rc={p_run.returncode}，请按交接文件手工接续）"
         elif mandate.agent == "codex":
             run_args = [
                 herdr_bin,
@@ -458,11 +463,22 @@ def _execute_resume_herdr(
                 "resume",
                 mandate.session_id,
             ]
-            subprocess.run(run_args, capture_output=True, text=True, timeout=8)
-            resumed_cmd_desc = f"codex resume {mandate.session_id}"
+            p_run = subprocess.run(run_args, capture_output=True, text=True, timeout=8)
+            if p_run.returncode == 0:
+                resumed_cmd_desc = f"codex resume {mandate.session_id}"
+                resume_verified = True
+            else:
+                resumed_cmd_desc = f"目录已就绪（codex resume 注入失败 rc={p_run.returncode}，请按交接文件手工接续）"
+        elif mandate.agent in ("agy", "opencode"):
+            resumed_cmd_desc = f"目录已就绪（{mandate.agent} 暂不支持自动接续原对话，已写入交接说明供手工接续）"
 
+    headline = (
+        f"[{wid}] 已在 herdr 后台标签 `{label}` 恢复现场（未抢当前焦点）"
+        if resume_verified
+        else f"[{wid}] 已在 herdr 后台标签 `{label}` 准备好目录现场（未自动恢复对话历史）"
+    )
     msg = (
-        f"[{wid}] 已在 herdr 后台标签 `{label}` 恢复现场（未抢当前焦点）\n"
+        f"{headline}\n"
         f"触发条件：{trigger_reason}\n"
         f"目录：{mandate.cwd}\n"
         f"动作：{resumed_cmd_desc}"

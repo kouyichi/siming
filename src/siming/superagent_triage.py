@@ -1018,9 +1018,11 @@ def sandbox_try_bookmark(db: SimingDB, ref: str) -> dict[str, Any]:
     return {
         "ok": True,
         "trial_dir": str(trial_dir),
+        "stage": "fetched_readme",
+        "verified_trial": False,
         "reply": (
-            f"🧪 **已拉取至隔离沙箱**：`{trial_dir}`\n"
+            f"🧪 **已取材至隔离沙箱（未跑验收，仅取材态）**：`{trial_dir}`\n"
             f"• 仓库：`https://github.com/{slug}`\n"
-            + (f"• README 摘要：{readme_txt[:220]}..." if readme_txt else "• 已就绪，可随时查看源码或跑验证命令。")
+            + (f"• README 摘要：{readme_txt[:220]}..." if readme_txt else "• 已就绪，跑过约定验证命令后才会记为「已试验」。")
         ),
     }

@@ -112,3 +112,18 @@ sequenceDiagram
   - 事件链：`situation`、`expectations`、`curiosity_questions`
   - 账本与消费：`ledger_txns`、`receivables`、`shop_order_items`、`sure_sync_map`、`sure_rules`、`subscriptions_detected`、`compute_assets`
   - 个人 OS：`health_metrics`、`vehicle_records`、`home_sensors`、`homelab_nodes`、`bambu_spools`、`bambu_jobs`、`trips`、`wiki_pages`、`msim_entries`、`graph_nodes`、`overnight_handoffs`
+  - v6.2 内核与闭环：`action_intents`、`action_receipts`、`message_ownership`、`message_refs`、`threads`、`handbacks`、`tickets`、`assignments`、`runs`、`run_inbox`、`run_events`、`resource_leases`、`capability_states`、`scheduled_obligations`、`calendar_objects`、`calendar_sync_state`、`health_observations`、`bookmark_decision_uses`、`corrections`、`learning_candidates`、`policy_versions`
+
+---
+
+## 6. v6.2 架构演进核心（D-35）
+
+1. **按场景分级执行（Tier-0 / Tier-1 / Tier-2 / Tier-3）**：不追求教条式「全部脚本化」，而是依据确定性、延迟预算与安全边界分级协作——Tier-0 纯代码承接权限/支付/状态机与账务；Tier-1 JEV 判别（700ms 墙钟预算，敏感载荷本地隔离不出境）做前台路由与快速分流；Tier-2 轻量 LLM 产出结构化草案并由代码校验；Tier-3 主力 LLM 与 Hermes Skills 承接开放对话与复杂研发探索。
+2. **三态收据与意图幂等（`receipts.py`）**：将 `authorization_consumed`、`order_submitted`、`paid_verified`/`external_verified` 彻底拆分落库；保留一次确认零二次弹窗下单体验，通过 `PaymentIntent` 与 `order_id` 精确对账防双击重扣并支持同店连续第二单；仅确认方案的执行器诚实落 `PLAN_CONFIRMED`；推送链路采用 Record-Before-Send（先写 `SENDING` 再发网）并严格以 `delivered is True` 判断是否已提醒。
+3. **FrontDesk ↔ Hermes 清晰边界与统一 RunInbox（`frontdesk.py` / `runtime_kernel.py`）**：同时保留完整 Hermes 聊天能力与完整司命 PA——通过 `message_ownership`（`owner + reply_epoch`）保证单条消息绝不双回复，通过 `message_refs` 区分引用 Hermes 闲聊与司命卡片（过期报价强制重核价），后台 8s 异步未命中时明确 `handback` 不黑洞吞没；多 Agent 长任务统一落 `Ticket / Assignment / Run / RunInbox`，支持运行中 `STEER` / `CANCEL` 插话、`generation` CAS 防脏写与 5 问停止交代。
+4. **三维能力生命周期与资源互斥（`modules.py` / `leases.py` / `delivery_outbox.py`）**：模块状态拆分为 `user_intent × readiness × notify_policy`，未到位硬件模块默认 `readiness=unconfigured`（停周期轮询、保留代码与手工查询，硬件与首样本到位自动进 `shadow → live`）；浏览器 9222 账号与 Git 仓库通过 `ResourceLease` 互斥加锁。
+5. **双向 CalDAV、Apple Health、无损收藏召回与 LearnGate（`caldav_sync.py` / `apple_health.py` / `bookmark_recall.py` / `learning_loop.py`）**：
+   - iCloud/CalDAV 双向读写配 `X-SIMING-ORIGIN-REF` 防回声、`ETag`/`If-Match` 412 冲突保护、`RRULE/EXDATE/RECURRENCE-ID` 展开、会议改期重算（保留 `manually_edited=1`）与 `/api/v6/ics` 只读订阅；
+   - Apple Health 经 `/siming/in/health` 接入，自动去重 Watch/iPhone 重叠样本，无数据时诚实返回 `unknown`；
+   - 收藏夹全量无损入库（不再入库前过滤餐厅/好物），支持饮食/购物/研发三链召回与「只是收藏不想买」用途排除；
+   - `Correction` 持久纠偏与一键回滚、`LearnGate` 留出集评测晋升 `PolicyVersion`、今日活动流与补偿撤销，Control Tower SPA 已拆离至 `tower_static/index.html` 并新增 `/api/v6/*` 只读投影（`connect_readonly()`）。

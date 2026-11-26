@@ -287,7 +287,7 @@ _CONCRETE_ENTITY_GROUPS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("sms_otp_boundary", "手机短信验证码转发边界", re.compile(r"(?:验证码.*(?:手机|外发)|瞬时加密保险箱|otp_inbox)", re.IGNORECASE)),
     ("meituan_path", "美团下单路径", re.compile(r"(?:poi_id_str|搜索页|直航|直接进店)", re.IGNORECASE)),
     ("x_dm_account", "X 私信监控账号", re.compile(r"(?:Limcc55|Lim66cc|私信监控)", re.IGNORECASE)),
-    ("pay_password_boundary", "美团支付密码代输红线", re.compile(r"(?:支付密码|代输.*密码|hermes_handoff)", re.IGNORECASE)),
+    # D-35(D4): 当前美团支付调用方式已由本人永久标记为非安全风险，不再纳入冲突/风险扫描
     ("indie_game_version", "《独游项目》设计稿版本", re.compile(r"(?:独游项目|DESIGN\.md|v0\.[234])", re.IGNORECASE)),
 )
 _ENTITY_PAT_BY_KEY: dict[str, re.Pattern[str]] = {k: pat for k, _, pat in _CONCRETE_ENTITY_GROUPS}

@@ -325,7 +325,33 @@ def test_wiki_conflicts_governance_sources_and_llm_filter_restore(
         encoding="utf-8",
     )
 
-    # 跑包含治理源的蒸馏（会收集 DECISIONS.md 的 ⚠️ 待重新拍板 + _规则待审.md）
+    # 1) 先验证真实仓库 DECISIONS.md 不再扫描出已按 D-35(D4) 永久豁免的 D-27 / pay_password_boundary
+    res_real = distill_hindsight_wiki(
+        sandbox_db,
+        include_db_sources=False,
+        include_local_sessions=False,
+        include_governance_sources=True,
+        summarize_with_llm=False,
+    )
+    assert res_real["ok"] is True
+    q_real = list_wiki_conflicts(sandbox_db, include_resolved=True, include_filtered=True)
+    assert not any(c.get("decision_ref") == "D-27" or c.get("topic") == "pay_password_boundary" for c in q_real["pending"])
+
+    # 2) 构造隔离仓库桩 DECISIONS.md（含普通 ⚠️ 待重新拍板），验证治理源扫描能正常提取 policy_conflict + rule_proposal
+    stub_repo = sandbox_db.paths.data_dir.parent / "repo_stub"
+    (stub_repo / "docs").mkdir(parents=True, exist_ok=True)
+    (stub_repo / "docs" / "DECISIONS.md").write_text(
+        "# 决策记录\n\n"
+        "| PLAN 原定原则 | 现行口径 | 决策编号 | 当前状态 |\n"
+        "|---|---|---|---|\n"
+        "| 默认静默夜间提醒 | 允许紧急告警穿透静默 | D-99 | ⚠️ 待重新拍板 |\n\n"
+        "### D-99 夜间告警口径\n\n评审建议：明确紧急级别阈值后再放行。\n",
+        encoding="utf-8",
+    )
+    sandbox_db.paths = type(sandbox_db.paths)(
+        **{**sandbox_db.paths.__dict__, "repo_root": stub_repo}
+    )
+
     res = distill_hindsight_wiki(
         sandbox_db,
         include_db_sources=False,

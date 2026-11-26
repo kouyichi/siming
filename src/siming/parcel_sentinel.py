@@ -277,7 +277,7 @@ def evaluate_hivebox_countdown(
                     dedup_window=timedelta(hours=24),
                     now=cur,
                 )
-                if res.get("ok"):
+                if res.get("delivered") is True:
                     db.set_meta(dedup_key, iso_now(cur))
                     notified.append(item["ref_id"])
 
@@ -464,7 +464,7 @@ def evaluate_return_window_sentinel(
                     dedup_window=timedelta(hours=48),
                     now=cur,
                 )
-                if res.get("ok"):
+                if res.get("delivered") is True or res.get("queued_for_morning") is True:
                     db.set_meta(dedup_key, iso_now(cur))
                     notified.append(item["item_id"])
 

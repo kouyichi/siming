@@ -15,6 +15,17 @@ from typing import Any, Callable, Optional
 
 from siming.config import load_policy
 from siming.db import SimingDB, current_boot_id, iso_now, now_local, parse_iso, pid_is_siming_process
+from siming.receipts import (
+    ActionResult,
+    ReceiptSummary,
+    approval_status_for_outcome,
+    build_intent_idempotency_key,
+    coerce_action_result,
+    create_or_get_intent,
+    format_receipt_status_line,
+    get_intent_with_receipts,
+    record_receipt_stage,
+)
 
 
 def _canonical_digest(params: dict[str, Any]) -> str:
@@ -136,26 +147,35 @@ def _exec_git_apply_worktree(params: dict[str, Any], db: SimingDB) -> str:
     if not patch_bytes.strip():
         return "隔离分支无任何文件改动，无需合入。"
 
+    from siming.leases import hold_resource_lease, repo_ref_resource
+
     patch_file = db.paths.tmp_root / f"apply-{hashlib.sha256(patch_bytes).hexdigest()[:12]}.patch"
-    try:
-        patch_file.write_bytes(patch_bytes)
-        chk = subprocess.run(
-            ["git", "apply", "--check", str(patch_file)],
-            cwd=str(repo_dir),
-            capture_output=True,
-            text=True,
-        )
-        if chk.returncode != 0:
-            raise RuntimeError(f"git apply --check 冲突: {chk.stderr.strip()}")
-        subprocess.run(
-            ["git", "apply", str(patch_file)],
-            cwd=str(repo_dir),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    finally:
-        patch_file.unlink(missing_ok=True)
+    with hold_resource_lease(
+        db,
+        resource_key=repo_ref_resource(repo_dir.name, "HEAD"),
+        holder_run_id=f"git_apply:{os.getpid()}",
+        mode="exclusive",
+        ttl_sec=60,
+    ):
+        try:
+            patch_file.write_bytes(patch_bytes)
+            chk = subprocess.run(
+                ["git", "apply", "--check", str(patch_file)],
+                cwd=str(repo_dir),
+                capture_output=True,
+                text=True,
+            )
+            if chk.returncode != 0:
+                raise RuntimeError(f"git apply --check 冲突: {chk.stderr.strip()}")
+            subprocess.run(
+                ["git", "apply", str(patch_file)],
+                cwd=str(repo_dir),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            patch_file.unlink(missing_ok=True)
 
     # 合入成功后清理临时 worktree
     subprocess.run(
@@ -205,7 +225,9 @@ def _exec_meituan_lock_cart(params: dict[str, Any], db: SimingDB) -> str:
 def _exec_meituan_submit_pay(params: dict[str, Any], db: SimingDB) -> str:
     from siming.meituan_pay import execute_meituan_submit_pay
 
-    return execute_meituan_submit_pay(params, db)
+    tok = str(params.get("__approval_token__") or "").strip().upper()
+    clean_p = {k: v for k, v in params.items() if k != "__approval_token__"}
+    return execute_meituan_submit_pay(clean_p, db, approval_token=tok)
 
 
 def _exec_jd_add_cart(params: dict[str, Any], db: SimingDB) -> str:
@@ -250,14 +272,54 @@ def _exec_compound_voice_batch(params: dict[str, Any], db: SimingDB) -> str:
 
     intents = params.get("intents") if isinstance(params.get("intents"), list) else []
     res = execute_compound_intents(db, intents)
-    return str(res.get("reply") or res.get("summary") or f"已执行复合指令 {len(intents)} 项。")
+    summary = str(res.get("reply") or res.get("summary") or f"已执行复合指令 {len(intents)} 项。")
+    results = res.get("results") if isinstance(res.get("results"), list) else []
+    failed_items = [r for r in results if isinstance(r, dict) and r.get("ok") is False]
+    if failed_items:
+        return ReceiptSummary(
+            summary,
+            ActionResult(
+                outcome="submitted_pending" if len(failed_items) < len(results) else "failed",
+                summary=summary,
+                authorization_consumed=True,
+                order_submitted=True,
+                external_verified=False,
+                evidence={"total": len(results), "failed_count": len(failed_items)},
+                error=f"{len(failed_items)}/{len(results)} 子动作失败",
+            ),
+        )
+    return ReceiptSummary(
+        summary,
+        ActionResult(
+            outcome="verified",
+            summary=summary,
+            authorization_consumed=True,
+            order_submitted=True,
+            external_verified=True,
+            evidence={"total": len(results), "failed_count": 0},
+        ),
+    )
 
 
 def _exec_meituan_combo_order(params: dict[str, Any], db: SimingDB) -> str:
     shops = params.get("shops") or params.get("legs") or []
     names = " + ".join(str(s.get("shop") or s.get("query") or "") for s in shops if isinstance(s, dict))
     loc = str(params.get("location") or "默认位置")
-    return f"🍱 已确认跨店双拼方案（{names or params.get('query', '')} · 定位：{loc}），可按各店子方案依次加购结算。"
+    summary = (
+        f"🍱 已确认跨店双拼方案（{names or params.get('query', '')} · 定位：{loc}）[仅方案确认，未触发外部扣款/下单]，"
+        "请按各店子确认卡依次加购结算。"
+    )
+    return ReceiptSummary(
+        summary,
+        ActionResult(
+            outcome="plan_only",
+            summary=summary,
+            authorization_consumed=True,
+            order_submitted=False,
+            external_verified=False,
+            evidence={"mode": "plan_only", "shops": names, "location": loc},
+        ),
+    )
 
 
 def _exec_jd_replenish_spool(params: dict[str, Any], db: SimingDB) -> str:
@@ -266,23 +328,98 @@ def _exec_jd_replenish_spool(params: dict[str, Any], db: SimingDB) -> str:
         from siming.replenish_cart import execute_jd_cart_add
 
         return execute_jd_cart_add({"url": url, "name": params.get("name") or params.get("spool_id", "3D耗材")}, db)
-    return f"🧵 已登记拓竹耗材补货确认：{params.get('spool_id', '')}（{params.get('material', 'PLA')} {params.get('color', '')}）。"
+    summary = f"🧵 已登记拓竹耗材补货方案（仅登记未下单）：{params.get('spool_id', '')}（{params.get('material', 'PLA')} {params.get('color', '')}）。"
+    return ReceiptSummary(
+        summary,
+        ActionResult(
+            outcome="plan_only",
+            summary=summary,
+            authorization_consumed=True,
+            order_submitted=False,
+            external_verified=False,
+            evidence={"mode": "plan_only", "spool_id": params.get("spool_id", "")},
+        ),
+    )
 
 
 def _exec_commute_rescue_bundle(params: dict[str, Any], db: SimingDB) -> str:
     reason = str(params.get("reason") or "极端天气/起晚")
     late_eta = str(params.get("late_eta_str") or "")
     delay_m = int(params.get("coffee_delay_min") or 0)
-    return (
-        f"🚨 已执行通勤应急捆绑包（{reason}）：\n"
-        f"• 🚕 滴滴叫车通道已就绪（预估 ¥{params.get('didi_fare_yuan', 0)}）\n"
-        f"• ☕ 咖啡取餐已顺延 {delay_m} 分钟\n"
+    summary = (
+        f"🚨 已确认通勤应急预案（{reason}）[仅方案与草稿确认，未自动叫车/改单]：\n"
+        f"• 🚕 滴滴叫车预估：¥{params.get('didi_fare_yuan', 0)}（需点叫车确认卡真发单）\n"
+        f"• ☕ 咖啡取餐建议顺延 {delay_m} 分钟\n"
         f"• 💬 报备草稿：「路上稍堵/天气原因，预计 {late_eta or '稍晚'} 到司」"
+    )
+    return ReceiptSummary(
+        summary,
+        ActionResult(
+            outcome="plan_only",
+            summary=summary,
+            authorization_consumed=True,
+            order_submitted=False,
+            external_verified=False,
+            evidence={"mode": "plan_only", "reason": reason},
+        ),
     )
 
 
 def _exec_overnight_next_step(params: dict[str, Any], db: SimingDB) -> str:
-    return f"🧪 已确认凌晨实验后续动作：{params.get('handoff_id', '')} -> {params.get('action', '继续推进')}。"
+    hid = str(params.get("handoff_id") or "")
+    nxt = str(params.get("suggested_next") or params.get("action") or "继续推进")
+    summary = f"🧪 已确认凌晨实验后续方案（仅方案确认，未自动改动远端训练）：`{hid}` -> `{nxt}`。"
+    return ReceiptSummary(
+        summary,
+        ActionResult(
+            outcome="plan_only",
+            summary=summary,
+            authorization_consumed=True,
+            order_submitted=False,
+            external_verified=False,
+            evidence={"mode": "plan_only", "handoff_id": hid, "next": nxt},
+        ),
+    )
+
+
+def _exec_runtime_dispatch_a2(params: dict[str, Any], db: SimingDB) -> str:
+    """已授权的 A2 Runtime 派单执行器：持久化真实 Ticket + Assignment 并进入调度队列，绝不返回空洞假文案。"""
+    import secrets
+
+    ts = iso_now()
+    rt = str(params.get("runtime") or "codex_sub")
+    task_preview = str(params.get("task_preview") or params.get("task") or "").strip()
+    cwd = str(params.get("cwd") or "")
+    ticket_id = f"TK-{now_local().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3)}"
+    assign_id = f"AS-{now_local().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3)}"
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO tickets (ticket_id, thread_id, parent_id, goal, mandate_json, status, created_at, updated_at)
+            VALUES (?, '', '', ?, ?, 'OPEN', ?, ?)
+            """,
+            (ticket_id, task_preview[:300], json.dumps({"runtime": rt, "cwd": cwd, "a2_approved": True}, ensure_ascii=False), ts, ts),
+        )
+        conn.execute(
+            """
+            INSERT INTO assignments (assignment_id, ticket_id, adapter, role, context_ref, status, created_at, updated_at)
+            VALUES (?, ?, ?, 'worker', ?, 'QUEUED', ?, ?)
+            """,
+            (assign_id, ticket_id, rt, cwd, ts, ts),
+        )
+    summary = f"✅ 已放行并持久化 A2 派单工单 `{ticket_id}`（Assignment `{assign_id}` · Runtime `{rt}` · 状态 `QUEUED`）。"
+    return ReceiptSummary(
+        summary,
+        ActionResult(
+            outcome="submitted_pending",
+            summary=summary,
+            external_order_id=ticket_id,
+            authorization_consumed=True,
+            order_submitted=True,
+            external_verified=False,
+            evidence={"ticket_id": ticket_id, "assignment_id": assign_id, "runtime": rt, "cwd": cwd},
+        ),
+    )
 
 
 BUILTIN_APPROVAL_EXECUTORS: dict[str, Callable[[dict[str, Any], SimingDB], str]] = {
@@ -299,7 +436,13 @@ BUILTIN_APPROVAL_EXECUTORS: dict[str, Callable[[dict[str, Any], SimingDB], str]]
     "jd_replenish_spool": _exec_jd_replenish_spool,
     "commute_rescue_bundle": _exec_commute_rescue_bundle,
     "overnight_next_step": _exec_overnight_next_step,
+    "overnight_handoff_next_step": _exec_overnight_next_step,
+    "runtime_dispatch_a2": _exec_runtime_dispatch_a2,
 }
+
+
+def is_builtin_action_registered(action: str) -> bool:
+    return str(action or "").strip() in BUILTIN_APPROVAL_EXECUTORS
 
 
 def refresh_approval_ttl_on_delivery(
@@ -428,15 +571,67 @@ def verify_and_apply_approval(
             if reject_audit:
                 tier, p_obj, tid, ec, det = reject_audit
                 db.write_audit(tier, "apply_rejected", p_obj, target_id=tid, approval_ref=clean_tok, exit_code=ec, detail=det)
-            return {"ok": False, "error": err_msg}
+            existing_intent = get_intent_with_receipts(db, approval_token=clean_tok)
+            out_err: dict[str, Any] = {"ok": False, "error": err_msg}
+            if existing_intent is not None:
+                out_err["intent_id"] = existing_intent["intent_id"]
+                out_err["intent"] = existing_intent
+                out_err["idempotent_replay"] = True
+            return out_err
+
+        # P0 三态收据第 1 态：授权已消费（authorization_consumed），在执行外部动作之前独立落账
+        idem_key = build_intent_idempotency_key(action, approval_token=clean_tok, target_id=target_id, params=params)
+        amt_c = int(round(float(params.get("final_payable_yuan") or params.get("amount_yuan") or 0.0) * 100))
+        max_c = int(round(float(params.get("max_authorized_yuan") or params.get("final_payable_yuan") or 0.0) * 100))
+        with db.transaction(conn):
+            intent, _ = create_or_get_intent(
+                db,
+                action=action,
+                idempotency_key=idem_key,
+                approval_token=clean_tok,
+                target_id=target_id,
+                amount_cents=amt_c,
+                max_authorized_cents=max_c,
+                quote=params if action == "meituan_submit_pay" else {},
+                initial_state="AUTHORIZED",
+                conn=conn,
+            )
+            record_receipt_stage(
+                db,
+                intent_id=intent["intent_id"],
+                stage="authorization_consumed",
+                approval_token=clean_tok,
+                ok=True,
+                summary=f"审批口令 {clean_tok} 已核验并消费授权",
+                new_intent_state="AUTHORIZED",
+                conn=conn,
+            )
+            conn.execute(
+                "UPDATE approvals SET intent_id=?, receipt_stage='authorization_consumed' WHERE token=?",
+                (intent["intent_id"], clean_tok),
+            )
+
+        exec_params = dict(params)
+        if action == "meituan_submit_pay":
+            exec_params["__approval_token__"] = clean_tok
 
         try:
-            summary = fn(params, db)
+            raw_res = fn(exec_params, db)
         except BaseException as exc:
             is_regular = isinstance(exc, Exception)
             fail_status = "FAILED" if is_regular else "FAILED_UNKNOWN"
             with db.transaction(conn):
-                conn.execute("UPDATE approvals SET status=? WHERE token=?", (fail_status, clean_tok))
+                conn.execute("UPDATE approvals SET status=?, receipt_stage=? WHERE token=?", (fail_status, fail_status.lower(), clean_tok))
+                record_receipt_stage(
+                    db,
+                    intent_id=intent["intent_id"],
+                    stage="failed",
+                    approval_token=clean_tok,
+                    ok=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                    new_intent_state=fail_status,
+                    conn=conn,
+                )
             db.write_audit(
                 claimed_row["tier"],
                 f"apply_failed:{action}",
@@ -448,15 +643,57 @@ def verify_and_apply_approval(
             )
             if not is_regular:
                 raise
-            return {"ok": False, "error": f"执行失败：{exc}"}
+            return {"ok": False, "error": f"执行失败：{exc}", "intent_id": intent["intent_id"]}
 
+        act_res = coerce_action_result(action, raw_res)
+        summary = act_res.summary or str(raw_res)
+        app_status = approval_status_for_outcome(act_res.outcome)
         applied_ts = iso_now()
         with db.transaction(conn):
-            conn.execute(
-                "UPDATE approvals SET status='APPLIED', applied_at=? WHERE token=?",
-                (applied_ts, clean_tok),
+            if act_res.order_submitted:
+                record_receipt_stage(
+                    db,
+                    intent_id=intent["intent_id"],
+                    stage="order_submitted",
+                    approval_token=clean_tok,
+                    ok=True,
+                    external_ref=act_res.external_order_id,
+                    evidence=act_res.evidence,
+                    summary=summary,
+                    new_intent_state="SUBMITTED" if not act_res.external_verified else None,
+                    conn=conn,
+                )
+            final_stage = (
+                "paid_verified"
+                if act_res.paid_verified
+                else ("external_verified" if act_res.external_verified else act_res.outcome)
             )
-            if target_id.startswith("W"):
+            final_intent_state = {
+                "paid_verified": "PAID_VERIFIED",
+                "verified": "VERIFIED",
+                "plan_only": "PLAN_CONFIRMED",
+                "needs_user_action": "NEEDS_USER_ACTION",
+                "submitted_pending": "RECONCILING",
+                "failed": "FAILED",
+            }.get(act_res.outcome, "VERIFIED")
+            record_receipt_stage(
+                db,
+                intent_id=intent["intent_id"],
+                stage=final_stage,
+                approval_token=clean_tok,
+                ok=(act_res.outcome != "failed"),
+                external_ref=act_res.external_order_id,
+                evidence=act_res.evidence,
+                summary=summary,
+                new_intent_state=final_intent_state,
+                error=act_res.error,
+                conn=conn,
+            )
+            conn.execute(
+                "UPDATE approvals SET status=?, applied_at=?, receipt_stage=? WHERE token=?",
+                (app_status, applied_ts, final_stage, clean_tok),
+            )
+            if target_id.startswith("W") and act_res.outcome in ("verified", "paid_verified", "plan_only"):
                 conn.execute(
                     "UPDATE waits SET status='DONE', result_summary=?, updated_at=? WHERE wait_id=? AND status NOT IN ('CANCELLED')",
                     (summary, applied_ts, target_id),
@@ -468,18 +705,28 @@ def verify_and_apply_approval(
                 params,
                 target_id=target_id,
                 approval_ref=clean_tok,
-                exit_code=0,
-                detail=summary,
+                exit_code=0 if act_res.outcome != "failed" else 1,
+                detail=f"[{final_stage}] {summary}",
                 conn=conn,
             )
-        if action == "jd_add_cart" or (action == "meituan_submit_pay" and "支付成功" in str(summary)):
+        if (action == "jd_add_cart" and act_res.external_verified) or (action == "meituan_submit_pay" and act_res.paid_verified):
             try:
                 from siming.replenish_cart import on_approval_applied_for_replenish
 
                 on_approval_applied_for_replenish(db, clean_tok)
             except Exception:
                 pass
-        return {"ok": True, "token": clean_tok, "target_id": target_id, "summary": summary}
+        return {
+            "ok": act_res.outcome != "failed",
+            "token": clean_tok,
+            "target_id": target_id,
+            "summary": summary,
+            "approval_status": app_status,
+            "intent_id": intent["intent_id"],
+            "outcome": act_res.outcome,
+            "receipt": act_res.to_dict(),
+            "receipt_line": format_receipt_status_line(act_res),
+        }
     finally:
         conn.close()
 

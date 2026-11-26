@@ -424,7 +424,7 @@ def evaluate_meal_regularity(
             keyboard=kb,
             now=cur,
         )
-        if res.get("ok"):
+        if res.get("delivered") is True:
             db.set_meta(dedup_key, iso_now(cur))
             nudged = True
 

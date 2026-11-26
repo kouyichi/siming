@@ -691,7 +691,7 @@ def ingest_remote_run_receipt(db: SimingDB, raw_json_text: str) -> dict[str, Any
                 ts,
             ),
         )
-        db.record_human_use("remote_run_done", "srr_receipt", ref_id=run_id, conn=conn)
+        db.record_usage_event("remote_run_done", "srr_receipt", actor="system_receipt", ref_id=run_id, conn=conn)
 
         if is_module_enabled(db, "remote_run"):
             icon = "🖥️✅" if exit_code == 0 else "🖥️❌"

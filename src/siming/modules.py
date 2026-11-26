@@ -423,8 +423,178 @@ def resolve_module_spec(key: str) -> Optional[ModuleSpec]:
     return None
 
 
+# D-35(D1-A)：5 个依赖未来新房/尚未到位硬件的能力，默认 readiness='unconfigured'（停周期 tick、保留代码与手工查询，硬件与首样本到位自动进 shadow -> live）
+UNARRIVED_HARDWARE_MODULES: frozenset[str] = frozenset(
+    {
+        "home_air_guard",
+        "homelab_ops",
+        "bambu_copilot",
+        "haos_night_owl",
+        "commute_hub",
+    }
+)
+
+VALID_USER_INTENTS: frozenset[str] = frozenset({"enabled", "disabled"})
+VALID_READINESS: frozenset[str] = frozenset({"unconfigured", "shadow", "live", "degraded", "parked"})
+VALID_NOTIFY_POLICIES: frozenset[str] = frozenset({"immediate", "digest", "muted"})
+
+
+def get_capability_state(db: SimingDB, module_or_rule_id: str) -> dict[str, Any]:
+    """D-35(D1-A) 三维能力生命周期查询：user_intent × readiness × notify_policy。"""
+    spec = resolve_module_spec(module_or_rule_id)
+    mod_id = spec.module_id if spec else module_or_rule_id
+    rule_id = spec.rule_id if spec else module_or_rule_id
+    default_readiness = "unconfigured" if mod_id in UNARRIVED_HARDWARE_MODULES else "live"
+
+    explicit_off = db.get_meta(f"module_disabled:{mod_id}")
+    conn = db.connect()
+    try:
+        cap_row = conn.execute("SELECT * FROM capability_states WHERE module_id = ?", (mod_id,)).fetchone()
+        rs_row = conn.execute("SELECT mode FROM rule_stats WHERE rule_id = ?", (rule_id,)).fetchone()
+    finally:
+        conn.close()
+
+    if cap_row:
+        user_intent = str(cap_row["user_intent"] or "enabled")
+        readiness = str(cap_row["readiness"] or default_readiness)
+        notify_policy = str(cap_row["notify_policy"] or "immediate")
+        verified_runs = int(cap_row["verified_runs"] or 0)
+        detail = str(cap_row["detail"] or "")
+    else:
+        user_intent = "disabled" if explicit_off == "1" else "enabled"
+        readiness = default_readiness
+        notify_policy = "immediate"
+        verified_runs = 0
+        detail = "未到位硬件默认休眠（保留代码与手动查询，设备就绪后自动升级 shadow→live）" if default_readiness == "unconfigured" else ""
+
+    if explicit_off == "1":
+        user_intent = "disabled"
+    if rs_row and rs_row["mode"] == "QUIET" and notify_policy == "immediate":
+        notify_policy = "digest"
+    if rs_row and rs_row["mode"] in ("DEMOTED", "OBSERVE", "FROZEN") and explicit_off != "0":
+        user_intent = "disabled"
+
+    tick_active = (user_intent == "enabled") and (readiness in ("shadow", "live", "degraded"))
+    return {
+        "module_id": mod_id,
+        "rule_id": rule_id,
+        "user_intent": user_intent,
+        "readiness": readiness,
+        "notify_policy": notify_policy,
+        "tick_active": tick_active,
+        "requires_hardware": mod_id in UNARRIVED_HARDWARE_MODULES,
+        "verified_runs": verified_runs,
+        "detail": detail,
+    }
+
+
+def set_capability_state(
+    db: SimingDB,
+    key: str,
+    *,
+    user_intent: Optional[str] = None,
+    readiness: Optional[str] = None,
+    notify_policy: Optional[str] = None,
+    detail: Optional[str] = None,
+) -> dict[str, Any]:
+    """更新指定能力的三维生命周期状态（user_intent / readiness / notify_policy）。"""
+    db.init_db()
+    spec = resolve_module_spec(key)
+    mod_id = spec.module_id if spec else key.strip()
+    cur = get_capability_state(db, mod_id)
+
+    ni = (user_intent or cur["user_intent"]).strip().lower()
+    nr = (readiness or cur["readiness"]).strip().lower()
+    np = (notify_policy or cur["notify_policy"]).strip().lower()
+    if ni not in VALID_USER_INTENTS:
+        raise ValueError(f"invalid user_intent: {ni}")
+    if nr not in VALID_READINESS:
+        raise ValueError(f"invalid readiness: {nr}")
+    if np not in VALID_NOTIFY_POLICIES:
+        raise ValueError(f"invalid notify_policy: {np}")
+
+    ts = iso_now()
+    det = cur["detail"] if detail is None else detail
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO capability_states (
+                module_id, user_intent, readiness, notify_policy, verified_runs, detail, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(module_id) DO UPDATE SET
+                user_intent = excluded.user_intent,
+                readiness = excluded.readiness,
+                notify_policy = excluded.notify_policy,
+                detail = excluded.detail,
+                updated_at = excluded.updated_at
+            """,
+            (mod_id, ni, nr, np, int(cur["verified_runs"]), det, ts),
+        )
+        if user_intent is not None:
+            db.set_meta(f"module_disabled:{mod_id}", "0" if ni == "enabled" else "1", conn=conn)
+    return get_capability_state(db, mod_id)
+
+
+def promote_capability_on_signal(
+    db: SimingDB,
+    module_id: str,
+    *,
+    has_probe: bool = False,
+    has_sample: bool = False,
+    verified_outcome: bool = False,
+    detail: str = "",
+) -> dict[str, Any]:
+    """硬件/数据源信号到达时自动推进就绪度：unconfigured -> shadow（探针+首样本齐备）-> live（有 1 次可核验结果）。"""
+    db.init_db()
+    cur = get_capability_state(db, module_id)
+    ts = iso_now()
+    readiness = cur["readiness"]
+    verified_runs = int(cur["verified_runs"])
+    if verified_outcome:
+        verified_runs += 1
+        if readiness in ("unconfigured", "shadow", "degraded"):
+            readiness = "live"
+    elif has_probe and has_sample and readiness == "unconfigured":
+        readiness = "shadow"
+
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO capability_states (
+                module_id, user_intent, readiness, notify_policy,
+                last_probe_at, last_sample_at, verified_runs, detail, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(module_id) DO UPDATE SET
+                readiness = excluded.readiness,
+                last_probe_at = COALESCE(excluded.last_probe_at, capability_states.last_probe_at),
+                last_sample_at = COALESCE(excluded.last_sample_at, capability_states.last_sample_at),
+                verified_runs = excluded.verified_runs,
+                detail = CASE WHEN excluded.detail != '' THEN excluded.detail ELSE capability_states.detail END,
+                updated_at = excluded.updated_at
+            """,
+            (
+                cur["module_id"],
+                cur["user_intent"],
+                readiness,
+                cur["notify_policy"],
+                ts if has_probe else None,
+                ts if has_sample else None,
+                verified_runs,
+                detail or cur["detail"],
+                ts,
+            ),
+        )
+    return get_capability_state(db, cur["module_id"])
+
+
+def is_module_tick_active(db: SimingDB, module_or_rule_id: str) -> bool:
+    """周期 tick 守卫专用判断：未到位硬件（readiness=unconfigured）或 parked / disabled 均不跑周期轮询，彻底降噪。"""
+    st = get_capability_state(db, module_or_rule_id)
+    return bool(st["tick_active"])
+
+
 def is_module_enabled(db: SimingDB, module_or_rule_id: str) -> bool:
-    """检查某模块当前是否启用（默认启用；被用户显式关闭或 DEMOTED/OBSERVE/FROZEN 时返回 False）。"""
+    """检查某模块当前是否启用（保留用户意愿与手工查询；周期轮询请优先调用 is_module_tick_active）。"""
     spec = resolve_module_spec(module_or_rule_id)
     rule_id = spec.rule_id if spec else module_or_rule_id
     mod_id = spec.module_id if spec else module_or_rule_id
@@ -515,6 +685,7 @@ def list_modules_status(db: SimingDB) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for spec in MODULE_SPECS:
         enabled = is_module_enabled(db, spec.module_id)
+        cap = get_capability_state(db, spec.module_id)
         st = stats_map.get(spec.rule_id) or {}
         last_used = use_map.get(spec.rule_id) or use_map.get(spec.module_id) or ""
         out.append(
@@ -523,6 +694,10 @@ def list_modules_status(db: SimingDB) -> list[dict[str, Any]]:
                 "title": spec.title,
                 "rule_id": spec.rule_id,
                 "enabled": enabled,
+                "user_intent": cap["user_intent"],
+                "readiness": cap["readiness"],
+                "notify_policy": cap["notify_policy"],
+                "tick_active": cap["tick_active"],
                 "mode": str(st.get("mode") or ("ACTIVE" if enabled else "DEMOTED")),
                 "sent_14d": int(st.get("sent_14d") or 0),
                 "last_used_at": last_used[:16].replace("T", " ") if last_used else "-",

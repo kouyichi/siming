@@ -212,6 +212,21 @@ def _process_single_edge_record(
         stats["heartbeat"] += 1
         return
 
+    if src == "ios_health":
+        from siming.apple_health import ingest_health_observations
+
+        ts_rx = str(rec.get("received_at") or "").strip() or None
+        h_payload: Any = rec
+        if text:
+            try:
+                h_payload = json.loads(text)
+            except Exception:
+                h_payload = rec
+        h_res = ingest_health_observations(db, h_payload, default_source="ios_health", ingested_at=ts_rx)
+        db.mark_source_ok("ios_health", detail=f"inserted={h_res.get('inserted', 0)}", ok_at=ts_rx)
+        stats["events"] += int(h_res.get("inserted", 0))
+        return
+
     if src in ("ios_sleep", "ios_focus") or text.strip().lower() in (
         "sleep",
         "asleep",

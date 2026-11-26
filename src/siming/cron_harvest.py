@@ -113,8 +113,8 @@ def harvest_cron_outputs(
             except OSError:
                 continue
             kind, body = parse_cron_output(raw)
-            db.set_meta(cursor_key, f.name)
             if kind == "silent":
+                db.set_meta(cursor_key, f.name)
                 continue
             stamp = f"{f.stem[5:10]} {f.stem[11:13]}:{f.stem[14:16]}"
             if kind == "failed":
@@ -132,6 +132,7 @@ def harvest_cron_outputs(
                         and not ln.strip().startswith("仅提醒，不自动申请")
                     ]
                     if is_module_enabled(db, "price_watch") and not non_drop_lines:
+                        db.set_meta(cursor_key, f.name)
                         continue
                     if is_module_enabled(db, "price_watch") and len(non_drop_lines) < len(
                         [ln for ln in body.splitlines() if ln.strip()]
@@ -143,6 +144,9 @@ def harvest_cron_outputs(
                     text = compact_for_digest(body, int(spec.get("max_lines", 10)), int(spec.get("max_line_chars", 90)))
                     text += f"\n（原文：~/.hermes/cron/output/{job_id}/{f.name}）"
                 res = push_external(db, text, rule_id=spec["rule"], ref_id=f"cron:{job_id}", level=level)
+            # P0 修复：必须在 push_external 受理成功后再推进游标，防止中途崩溃导致永久漏推
+            if res.get("ok"):
+                db.set_meta(cursor_key, f.name)
             stats["pushed"].append({"job": spec["name"], "file": f.name, "kind": kind, "result": res})
     db.mark_source_ok("cron_harvest", detail=f"pushed={len(stats['pushed'])}")
     return stats

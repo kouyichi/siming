@@ -167,11 +167,11 @@ def send_qq_message(
                 (dedup_hash, dedup_cutoff),
             ).fetchone()
         if dup:
-            return {"ok": True, "delivered": False, "skipped": "duplicate", "outbox_id": dup["id"]}
+            return {"ok": True, "delivered": False, "delivery_state": "DUPLICATE", "skipped": "duplicate", "outbox_id": dup["id"]}
 
         allow_push, rule_is_trial = _rule_allows_push(conn, rule_id)
         if not allow_push and not urgent:
-            return {"ok": True, "delivered": False, "skipped": "rule_demoted_or_observe"}
+            return {"ok": True, "delivered": False, "delivery_state": "SUPPRESSED", "skipped": "rule_demoted_or_observe"}
 
         if (trial or rule_is_trial) and not clean_text.startswith("[试运行]"):
             clean_text = f"[试运行] {clean_text}"
@@ -218,7 +218,7 @@ def send_qq_message(
                     """,
                     (ob_id, ref_id, rule_id, clean_text, iso_now(), dedup_hash, iso_now()),
                 )
-            return {"ok": True, "delivered": False, "queued_for_morning": True, "outbox_id": ob_id}
+            return {"ok": True, "delivered": False, "delivery_state": "DEFERRED", "queued_for_morning": True, "outbox_id": ob_id}
     finally:
         conn.close()
 
@@ -236,6 +236,22 @@ def send_qq_message(
             ref_id=ref_id,
             rule_id=rule_id,
             sub_meta=sub_meta,
+        )
+
+    # P0 修复（Record-Before-Send）：在发起真实网络发送前先持久化 SENDING 记录，确保崩溃可追踪防重复发！
+    ts_pre = iso_now()
+    ob_id = f"OB-{now_local().strftime('%Y%m%d%H%M%S')}-{dedup_hash[:6]}"
+    if window.total_seconds() <= 0:
+        ob_id += "-" + os.urandom(3).hex()
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO outbox (
+                id, ref_id, rule_id, text, send_at, status, delivery_state, channel,
+                dedup_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'SENDING', 'SENDING', 'qqbot', ?, ?)
+            """,
+            (ob_id, ref_id, rule_id, clean_text, ts_pre, dedup_hash, ts_pre),
         )
 
     ok = False
@@ -262,30 +278,22 @@ def send_qq_message(
         sent_with_kb = False
 
     ts = iso_now()
-    ob_id = f"OB-{now_local().strftime('%Y%m%d%H%M%S')}-{dedup_hash[:6]}"
-    if window.total_seconds() <= 0:
-        # 关闭去重时同秒同文是合法的（如连续两条同裸码私信），补随机后缀防主键冲突
-        ob_id += "-" + os.urandom(3).hex()
+    final_status = "SENT" if ok else "FAILED"
+    final_delivery_state = "DELIVERED" if ok else "FAILED"
     with db.transaction() as conn:
         conn.execute(
             """
-            INSERT INTO outbox (
-                id, ref_id, rule_id, text, send_at, status, channel,
-                dedup_hash, sent_msg_id, created_at, sent_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            UPDATE outbox
+            SET status = ?, delivery_state = ?, channel = ?, sent_msg_id = ?, sent_at = ?
+            WHERE id = ?
             """,
             (
-                ob_id,
-                ref_id,
-                rule_id,
-                clean_text,
-                ts,
-                "SENT" if ok else "FAILED",
+                final_status,
+                final_delivery_state,
                 used_channel,
-                dedup_hash,
                 msg_id or None,
-                ts,
                 ts if ok else None,
+                ob_id,
             ),
         )
         conn.execute(
@@ -365,9 +373,25 @@ def send_qq_message(
                             json.dumps(meta_obj, ensure_ascii=False),
                         ),
                     )
+    if ok and msg_id:
+        try:
+            from siming.frontdesk import bind_message_ref
+
+            bind_message_ref(
+                db,
+                channel=used_channel,
+                external_msg_id=str(msg_id),
+                owner="siming",
+                ref_id=ref_id,
+                approval_token=str(meta_obj.get("approval_token") or ""),
+                summary=clean_text[:120],
+            )
+        except Exception:
+            pass
     return {
         "ok": ok,
         "delivered": ok,
+        "delivery_state": final_delivery_state,
         "channel": used_channel,
         "msg_id": msg_id,
         "outbox_id": ob_id,

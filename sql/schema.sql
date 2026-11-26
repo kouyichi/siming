@@ -675,3 +675,372 @@ CREATE TABLE IF NOT EXISTS friend_profiles (
     favorite_games_json TEXT NOT NULL DEFAULT '[]',
     updated_at TEXT NOT NULL
 );
+
+-- 统一会议室签到表（从 gobang_checkin.py 收归统一 schema，消除运行期建表）
+CREATE TABLE IF NOT EXISTS gobang_checkins (
+    msgid TEXT PRIMARY KEY,
+    chatid INTEGER NOT NULL DEFAULT 0,
+    room_id TEXT NOT NULL DEFAULT '',
+    room_name TEXT NOT NULL DEFAULT '',
+    schedule_title TEXT NOT NULL DEFAULT '',
+    subtitle TEXT NOT NULL DEFAULT '',
+    sign_url TEXT NOT NULL DEFAULT '',
+    ctime_ms INTEGER NOT NULL DEFAULT 0,
+    deadline_at TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    book_id TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    detail TEXT NOT NULL DEFAULT '',
+    signed_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
+-- P0: 动作意图与三态收据（authorization_consumed -> order_submitted/running -> external_verified/paid_verified）
+CREATE TABLE IF NOT EXISTS action_intents (
+    intent_id TEXT PRIMARY KEY,
+    approval_token TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    target_id TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL DEFAULT 'CREATED',         -- CREATED / AUTHORIZED / SUBMITTING / PAYING / RECONCILING / PAID_VERIFIED / NEEDS_USER_ACTION / PLAN_CONFIRMED / VERIFIED / FAILED
+    auth_consumed_at TEXT,
+    submitted_at TEXT,
+    verified_at TEXT,
+    external_order_id TEXT NOT NULL DEFAULT '',
+    amount_cents INTEGER NOT NULL DEFAULT 0,
+    max_authorized_cents INTEGER NOT NULL DEFAULT 0,
+    quote_json TEXT NOT NULL DEFAULT '{}',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    summary TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_action_intents_token ON action_intents(approval_token, state);
+CREATE INDEX IF NOT EXISTS idx_action_intents_order ON action_intents(external_order_id);
+
+CREATE TABLE IF NOT EXISTS action_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    intent_id TEXT NOT NULL,
+    approval_token TEXT NOT NULL DEFAULT '',
+    stage TEXT NOT NULL,                           -- authorization_consumed / order_submitted / running / paid_verified / external_verified / needs_user_action / plan_only / failed
+    ok INTEGER NOT NULL DEFAULT 1,
+    external_ref TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    summary TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_action_receipts_intent ON action_receipts(intent_id, created_at);
+
+-- P1: FrontDesk 回复权归属、消息引用绑定、Thread 最小工作事实、交接与多 Agent 工单运行时
+CREATE TABLE IF NOT EXISTS message_ownership (
+    envelope_key TEXT PRIMARY KEY,                 -- channel:account:conversation:message_id
+    channel TEXT NOT NULL,
+    account TEXT NOT NULL DEFAULT '',
+    conversation TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL,
+    owner TEXT NOT NULL,                           -- hermes / siming
+    reply_epoch INTEGER NOT NULL DEFAULT 1,
+    thread_id TEXT NOT NULL DEFAULT '',
+    route_tier TEXT NOT NULL DEFAULT 'tier0',      -- tier0 / jev / light_llm / main_llm
+    route_reason TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'ACTIVE',         -- ACTIVE / COMPLETED / HANDBACK
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_msg_owner_conv ON message_ownership(channel, conversation, created_at);
+
+CREATE TABLE IF NOT EXISTS message_refs (
+    ref_key TEXT PRIMARY KEY,                      -- channel:account:conversation:platform_msg_id
+    channel TEXT NOT NULL,
+    account TEXT NOT NULL DEFAULT '',
+    conversation TEXT NOT NULL DEFAULT '',
+    platform_msg_id TEXT NOT NULL,
+    owner TEXT NOT NULL DEFAULT 'siming',
+    thread_id TEXT NOT NULL DEFAULT '',
+    card_id TEXT NOT NULL DEFAULT '',
+    approval_token TEXT NOT NULL DEFAULT '',
+    quote_version INTEGER NOT NULL DEFAULT 1,
+    meta_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_msg_refs_thread ON message_refs(thread_id, created_at);
+
+CREATE TABLE IF NOT EXISTS threads (
+    thread_id TEXT PRIMARY KEY,
+    channel TEXT NOT NULL DEFAULT 'qqbot',
+    conversation TEXT NOT NULL DEFAULT '',
+    goal TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'ACTIVE',         -- ACTIVE / ENDED
+    entity_refs_json TEXT NOT NULL DEFAULT '{}',
+    facts_with_source_json TEXT NOT NULL DEFAULT '[]',
+    pending_question TEXT NOT NULL DEFAULT '',
+    active_run_id TEXT NOT NULL DEFAULT '',
+    last_verified_effect_json TEXT NOT NULL DEFAULT '{}',
+    picks_json TEXT NOT NULL DEFAULT '[]',
+    picks_version INTEGER NOT NULL DEFAULT 0,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    ended_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_threads_conv ON threads(channel, conversation, status, updated_at);
+
+CREATE TABLE IF NOT EXISTS handbacks (
+    handback_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    envelope_key TEXT NOT NULL DEFAULT '',
+    from_owner TEXT NOT NULL,
+    to_owner TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    context_rev INTEGER NOT NULL DEFAULT 1,
+    reply_epoch INTEGER NOT NULL DEFAULT 1,
+    summary TEXT NOT NULL DEFAULT '',
+    open_items_json TEXT NOT NULL DEFAULT '[]',
+    next_cursor TEXT NOT NULL DEFAULT '',
+    delivered INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_handbacks_thread ON handbacks(thread_id, created_at);
+
+CREATE TABLE IF NOT EXISTS tickets (
+    ticket_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL DEFAULT '',
+    parent_id TEXT NOT NULL DEFAULT '',
+    goal TEXT NOT NULL,
+    mandate_json TEXT NOT NULL DEFAULT '{}',
+    done_check TEXT NOT NULL DEFAULT '',
+    deadline TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'OPEN',           -- OPEN / RUNNING / PAUSED / DONE / CANCELLED / FAILED
+    result_summary TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tickets_thread ON tickets(thread_id, status);
+
+CREATE TABLE IF NOT EXISTS assignments (
+    assignment_id TEXT PRIMARY KEY,
+    ticket_id TEXT NOT NULL,
+    adapter TEXT NOT NULL,                         -- claude / codex / agy / opencode / meituan_cdp / srr / hermes
+    role TEXT NOT NULL DEFAULT 'worker',           -- worker / editor / reviewer / observer
+    capabilities_json TEXT NOT NULL DEFAULT '[]',
+    context_ref TEXT NOT NULL DEFAULT '',
+    resource_claims_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'QUEUED',         -- QUEUED / RUNNING / DONE / CANCELLED / FAILED
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_assignments_ticket ON assignments(ticket_id, status);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT PRIMARY KEY,
+    assignment_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL DEFAULT '',
+    attempt INTEGER NOT NULL DEFAULT 1,
+    generation INTEGER NOT NULL DEFAULT 1,
+    owner_pid INTEGER,
+    lease_until TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'PENDING',         -- PENDING / RUNNING / STEERED / CANCELLING / CANCELLED / DONE / FAILED
+    applied_seq INTEGER NOT NULL DEFAULT 0,
+    received_seq INTEGER NOT NULL DEFAULT 0,
+    step_reached TEXT NOT NULL DEFAULT '',
+    external_effects_json TEXT NOT NULL DEFAULT '[]',
+    artifact_ref TEXT NOT NULL DEFAULT '',
+    resume_hint TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_runs_state ON runs(state, updated_at);
+
+CREATE TABLE IF NOT EXISTS run_inbox (
+    run_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,                            -- STEER / CANCEL / ANSWER
+    expected_revision INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    actor TEXT NOT NULL DEFAULT 'human',
+    status TEXT NOT NULL DEFAULT 'PENDING',        -- PENDING / RECEIVED / APPLIED / REJECTED
+    created_at TEXT NOT NULL,
+    applied_at TEXT,
+    PRIMARY KEY (run_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS run_events (
+    run_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,                            -- STARTED / PROGRESS / STEER_APPLIED / STOP_HANDOFF / ARTIFACT / DONE / FAILED
+    causal_ref TEXT NOT NULL DEFAULT '',
+    progress TEXT NOT NULL DEFAULT '',
+    artifact_ref TEXT NOT NULL DEFAULT '',
+    evidence_ref TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, seq)
+);
+
+-- P2: 资源租约互斥 + 三维能力生命周期 + 四原语统一提醒调度
+CREATE TABLE IF NOT EXISTS resource_leases (
+    resource_key TEXT PRIMARY KEY,
+    mode TEXT NOT NULL DEFAULT 'exclusive',        -- shared / exclusive
+    holder_run_id TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 1,
+    acquired_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_resource_leases_exp ON resource_leases(expires_at);
+
+CREATE TABLE IF NOT EXISTS capability_states (
+    module_id TEXT PRIMARY KEY,
+    user_intent TEXT NOT NULL DEFAULT 'enabled',   -- enabled / disabled
+    readiness TEXT NOT NULL DEFAULT 'live',        -- unconfigured / shadow / live / degraded / parked
+    notify_policy TEXT NOT NULL DEFAULT 'immediate', -- immediate / digest / muted
+    last_probe_at TEXT,
+    last_sample_at TEXT,
+    verified_runs INTEGER NOT NULL DEFAULT 0,
+    detail TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS scheduled_obligations (
+    ob_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,                            -- once / rrule / monitor / goal
+    rule_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    rrule TEXT NOT NULL DEFAULT '',
+    next_fire_at TEXT NOT NULL DEFAULT '',
+    baseline_json TEXT NOT NULL DEFAULT '{}',
+    cooldown_sec INTEGER NOT NULL DEFAULT 0,
+    last_fired_at TEXT,
+    last_delivered_at TEXT,
+    calendar_uid TEXT NOT NULL DEFAULT '',
+    manually_edited INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',         -- ACTIVE / PAUSED / DONE / CANCELLED
+    meta_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sched_ob_fire ON scheduled_obligations(status, next_fire_at);
+
+-- P3: #4 双向 iCloud/CalDAV 日历对象与同步态 + Apple Health 观测事实
+CREATE TABLE IF NOT EXISTS calendar_objects (
+    obj_key TEXT PRIMARY KEY,                      -- account::calendar::uid[::recurrence_id]
+    account TEXT NOT NULL,
+    calendar TEXT NOT NULL,
+    href TEXT NOT NULL DEFAULT '',
+    uid TEXT NOT NULL,
+    recurrence_id TEXT NOT NULL DEFAULT '',
+    etag TEXT NOT NULL DEFAULT '',
+    sequence INTEGER NOT NULL DEFAULT 0,
+    tzid TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+    start_at TEXT NOT NULL,
+    end_at TEXT NOT NULL DEFAULT '',
+    all_day INTEGER NOT NULL DEFAULT 0,
+    summary TEXT NOT NULL DEFAULT '',
+    location TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    rrule TEXT NOT NULL DEFAULT '',
+    exdates_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'CONFIRMED',      -- CONFIRMED / TENTATIVE / CANCELLED
+    origin_ref TEXT NOT NULL DEFAULT '',           -- 防回声标记：司命写入对象回步不重复建提醒
+    raw_ics TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cal_obj_window ON calendar_objects(status, start_at, end_at);
+CREATE INDEX IF NOT EXISTS idx_cal_obj_origin ON calendar_objects(origin_ref);
+
+CREATE TABLE IF NOT EXISTS calendar_sync_state (
+    sync_key TEXT PRIMARY KEY,                     -- account::calendar
+    account TEXT NOT NULL,
+    calendar TEXT NOT NULL,
+    caldav_url TEXT NOT NULL DEFAULT '',
+    sync_token TEXT NOT NULL DEFAULT '',
+    ctag TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL DEFAULT 'caldav_rw',        -- ics_ro / caldav_rw
+    last_synced_at TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS health_observations (
+    obs_key TEXT PRIMARY KEY,                      -- source::source_sample_id 或 source::type::window_key
+    source TEXT NOT NULL,                          -- apple_health_shortcut / apple_healthkit / manual
+    source_sample_id TEXT NOT NULL DEFAULT '',
+    obs_type TEXT NOT NULL,                        -- sleep_interval / sleep_duration_h / sleep_debt_h / steps / weight_kg / resting_hr
+    start_at TEXT NOT NULL,
+    end_at TEXT NOT NULL DEFAULT '',
+    timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+    value_num REAL NOT NULL,
+    unit TEXT NOT NULL DEFAULT '',
+    device TEXT NOT NULL DEFAULT '',
+    revision INTEGER NOT NULL DEFAULT 1,
+    deleted_at TEXT,
+    consent_scope TEXT NOT NULL DEFAULT 'daily_summary',
+    meta_json TEXT NOT NULL DEFAULT '{}',
+    ingested_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_health_obs_type_time ON health_observations(obs_type, start_at, deleted_at);
+
+-- P3 (#6): 收藏决策使用与反馈
+CREATE TABLE IF NOT EXISTS bookmark_decision_uses (
+    use_id TEXT PRIMARY KEY,
+    bookmark_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL DEFAULT '',
+    purpose TEXT NOT NULL DEFAULT 'food',          -- food / shopping / dev
+    rank INTEGER NOT NULL DEFAULT 1,
+    shown_reason TEXT NOT NULL DEFAULT '',
+    chosen INTEGER NOT NULL DEFAULT 0,
+    rejected_reason TEXT NOT NULL DEFAULT '',      -- e.g. just_saved_not_buying
+    outcome TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bmark_use_bid ON bookmark_decision_uses(bookmark_id, created_at);
+
+-- P4 (#5): 人工纠偏、LearnGate 候选与策略版本
+CREATE TABLE IF NOT EXISTS corrections (
+    corr_id TEXT PRIMARY KEY,
+    user_intent TEXT NOT NULL,
+    target_object TEXT NOT NULL,                   -- e.g. merchant:示例停车场 / shop:示例餐厅 / rule:morning_brief
+    field_name TEXT NOT NULL,
+    old_value TEXT NOT NULL DEFAULT '',
+    new_value TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'exact',           -- exact / company_only / home_only / global
+    source TEXT NOT NULL DEFAULT 'qq',
+    version INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'ACTIVE',         -- ACTIVE / SUPERSEDED / REVERTED
+    superseded_by TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_corrections_target ON corrections(target_object, status);
+
+CREATE TABLE IF NOT EXISTS learning_candidates (
+    cand_id TEXT PRIMARY KEY,
+    trigger_case TEXT NOT NULL,
+    proposed_rule TEXT NOT NULL,
+    target_capability TEXT NOT NULL,
+    positive_examples_json TEXT NOT NULL DEFAULT '[]',
+    negative_examples_json TEXT NOT NULL DEFAULT '[]',
+    expected_metric TEXT NOT NULL DEFAULT '',
+    baseline_version TEXT NOT NULL DEFAULT '',
+    proposer TEXT NOT NULL DEFAULT 'system',
+    requires_human_approval INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL DEFAULT 'candidate',       -- candidate / replay / shadow / promoted / declined / reverted
+    holdout_passed INTEGER NOT NULL DEFAULT 0,
+    holdout_total INTEGER NOT NULL DEFAULT 0,
+    eval_report_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS policy_versions (
+    version_id TEXT PRIMARY KEY,
+    cand_id TEXT NOT NULL DEFAULT '',
+    target_capability TEXT NOT NULL,
+    rule_diff TEXT NOT NULL,
+    eval_result_json TEXT NOT NULL DEFAULT '{}',
+    approved_scope TEXT NOT NULL DEFAULT '',
+    prev_version_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'ACTIVE',         -- ACTIVE / REVERTED
+    deployed_at TEXT NOT NULL
+);

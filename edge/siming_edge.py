@@ -375,16 +375,31 @@ class EdgeStore:
         enc_text = self._encrypt_outbox_text(text)
         conn = self.connect()
         try:
-            # 严禁滞后到达的 put 复活已被 WITHDRAWN 墓碑标记的提醒！
+            # P0 修复：严禁滞后/重放的 put 复活已被 WITHDRAWN 墓碑或已离线 SENT/DELIVERED 的终态提醒，并按 synced_at 单调对账！
             conn.execute(
                 """
                 INSERT INTO prescheduled_outbox (ref_id, text, fire_at, synced_at, status)
                 VALUES (?, ?, ?, ?, 'PENDING')
                 ON CONFLICT(ref_id) DO UPDATE SET
-                    text = CASE WHEN prescheduled_outbox.status = 'WITHDRAWN' THEN prescheduled_outbox.text ELSE excluded.text END,
-                    fire_at = CASE WHEN prescheduled_outbox.status = 'WITHDRAWN' THEN prescheduled_outbox.fire_at ELSE excluded.fire_at END,
-                    synced_at = CASE WHEN prescheduled_outbox.status = 'WITHDRAWN' THEN prescheduled_outbox.synced_at ELSE excluded.synced_at END,
-                    status = CASE WHEN prescheduled_outbox.status = 'WITHDRAWN' THEN 'WITHDRAWN' ELSE 'PENDING' END
+                    text = CASE
+                        WHEN prescheduled_outbox.status IN ('WITHDRAWN', 'SENT', 'DELIVERED') THEN prescheduled_outbox.text
+                        WHEN excluded.synced_at < prescheduled_outbox.synced_at THEN prescheduled_outbox.text
+                        ELSE excluded.text
+                    END,
+                    fire_at = CASE
+                        WHEN prescheduled_outbox.status IN ('WITHDRAWN', 'SENT', 'DELIVERED') THEN prescheduled_outbox.fire_at
+                        WHEN excluded.synced_at < prescheduled_outbox.synced_at THEN prescheduled_outbox.fire_at
+                        ELSE excluded.fire_at
+                    END,
+                    synced_at = CASE
+                        WHEN prescheduled_outbox.status IN ('WITHDRAWN', 'SENT', 'DELIVERED') THEN prescheduled_outbox.synced_at
+                        WHEN excluded.synced_at < prescheduled_outbox.synced_at THEN prescheduled_outbox.synced_at
+                        ELSE excluded.synced_at
+                    END,
+                    status = CASE
+                        WHEN prescheduled_outbox.status IN ('WITHDRAWN', 'SENT', 'DELIVERED') THEN prescheduled_outbox.status
+                        ELSE 'PENDING'
+                    END
                 """,
                 (ref_id, enc_text, fire_at, synced_at),
             )
@@ -556,6 +571,7 @@ def run_http_server(store: EdgeStore, host: str, port: int) -> None:
         "/siming/in/sms_backfill": "ios_sms_backfill",
         "/siming/in/bill_ocr": "ios_bill_ocr",
         "/siming/in/drop": "ios_drop",
+        "/siming/in/health": "ios_health",
     }
     receipt_rate_lock = threading.Lock()
     receipt_recent_epochs: list[float] = []

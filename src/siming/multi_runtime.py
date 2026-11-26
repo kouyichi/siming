@@ -408,8 +408,12 @@ def dispatch_via_runtime(
     output = ""
     ok = True
     error = ""
+    meter_source = "estimated"
+    persisted_ticket_id = ""
+    persisted_assignment_id = ""
     if dry_run:
         output = f"[DRY-RUN:{selection['runtime']}] {cmd_rendered}"
+        meter_source = "dry_run_estimate"
     elif runner_fn is not None:
         res = runner_fn(
             runtime=selection["runtime"],
@@ -421,23 +425,58 @@ def dispatch_via_runtime(
         ok = bool((res or {}).get("ok", True))
         output = str((res or {}).get("output") or "")
         error = str((res or {}).get("error") or "")
+        meter_source = "provider_usage" if (res or {}).get("tokens_in") is not None else "cli_receipt"
     elif os.environ.get("SIMING_DISABLE_LLM") == "1":
         output = f"[OFFLINE-STUB:{selection['runtime']}] SIMING_DISABLE_LLM=1"
+        meter_source = "offline_stub"
     else:
-        output = f"[QUEUED:{selection['runtime']}] {cmd_rendered}"
+        # P0 修复：严禁返回无持久化的虚假 [QUEUED] + ok=True；必须落盘真实 Ticket + Assignment 入库！
+        import secrets
+
+        ts_q = iso_now()
+        persisted_ticket_id = f"TK-{ts_q[0:19].replace('-', '').replace(':', '').replace('T', '')}-{secrets.token_hex(3)}"
+        persisted_assignment_id = f"AS-{ts_q[0:19].replace('-', '').replace(':', '').replace('T', '')}-{secrets.token_hex(3)}"
+        with db.transaction() as qconn:
+            qconn.execute(
+                """
+                INSERT INTO tickets (ticket_id, thread_id, parent_id, goal, mandate_json, status, created_at, updated_at)
+                VALUES (?, '', '', ?, ?, 'OPEN', ?, ?)
+                """,
+                (
+                    persisted_ticket_id,
+                    clean_task[:300],
+                    json.dumps({"runtime": selection["runtime"], "cwd": work_cwd, "task_kind": task_kind}, ensure_ascii=False),
+                    ts_q,
+                    ts_q,
+                ),
+            )
+            qconn.execute(
+                """
+                INSERT INTO assignments (assignment_id, ticket_id, adapter, role, context_ref, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'worker', ?, 'QUEUED', ?, ?)
+                """,
+                (persisted_assignment_id, persisted_ticket_id, selection["runtime"], work_cwd, ts_q, ts_q),
+            )
+        output = f"[QUEUED:{selection['runtime']}:{persisted_ticket_id}] {cmd_rendered}"
+        meter_source = "queued_estimate"
 
     tokens_in = max(1, len(enriched_prompt) // 3)
     tokens_out = max(0, len(output) // 3)
     rate = float(selection["profile"].get("cost_per_1k_cny", 0.0))
     cost_cny = round(((tokens_in + tokens_out) / 1000.0) * rate, 6)
 
-    db.record_usage(
+    db.record_model_call(
         model=selection["model"],
+        provider=selection["provider"],
         runner=selection["runtime"],
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         cost_cny=cost_cny,
-        ref_id=f"w3:{task_kind}",
+        meter_source=meter_source,
+        outcome="ok" if ok else "failed",
+        billing_kind="subscription" if selection["kind"] == "subscription" else "cash",
+        run_id=persisted_assignment_id,
+        ref_id=persisted_ticket_id or f"w3:{task_kind}",
     )
 
     return {

@@ -19,16 +19,18 @@
 | 原定原则 | 现行口径 | 决策编号 | 状态 |
 | :--- | :--- | :--- | :--- |
 | 不做网页看板，仅用聊天软件与终端 | 日常轻执行用聊天按钮，重审阅与治理用受密保护的本地 Control Tower | D-32 | 已落地 |
-| 严禁任何自动支付流程 | 默认仅停留在零扣款结算预览页；仅当用户显式开启本地 `hermes_handoff` 机密通道时启用受控支付闭环 | D-27 | ⚠️ 待重新拍板（默认关闭） |
+| 严禁任何自动支付流程 | 一次确认零二次弹窗自动下单与本地隔离支付（`hermes_handoff` / `cdp_cashier_touch_pin`），配三态收据与 `PaymentIntent` 幂等对账；保留当前调用方式并永久标记为非安全风险 | D-27 | ✅ 永久豁免（D-35 D4 拍板，非安全风险） |
 | 推送不设全局上限 | 启用 Push Guard 熔断（单规则 6/h、全机 20/h）与 14 天低处理率自动转静默 `QUIET` | D-33 | 已落地 |
 | 会话扫描自动排期提醒 | 兜底扫描仅生成 `PROPOSED` 提议，用户明确回「记下 Wxx」才生效，72h 自动过期 | D-34 | 已落地 |
+| 单一脚本化口径、二态模块开关、只读日历 | **v6.2 双审重构基线**：按场景分级执行（Tier-0 纯代码 / Tier-1 JEV 700ms / Tier-2 轻量 LLM / Tier-3 主力 LLM）；FrontDesk↔Hermes 单一回复归属与统一 RunInbox；三维能力生命周期（D1-A）；iCloud/CalDAV 双向读写（D3-B）；Apple Health + 收藏无损召回 + LearnGate | D-35 | ✅ 已落地（v6.2 现行基线） |
 
 ---
 
-### D-27 受控支付闭环边界（默认关闭，需人工审慎评估）
+### D-27 受控支付闭环边界（D-35 D4 永久豁免为非安全风险）
 
-- **背景**：美团 H5 结算默认只停在零扣款结算预览页并签发 `apply Axx` 确认卡。仅当用户在 `~/.config/siming/policy.yaml` 显式设置 `meituan_pay.hermes_handoff.enabled: true` 并自行提供本地 `0600` 说明文件时，才会经临时文件（阅后即焚）交给独立执行通道并在事后以纯代码核验订单状态。
-- **评审建议**：开源发行版默认关闭此项（`enabled: false`），建议大多数用户保持默认的「预览锁单 + 官方 App 人工付款」模式。
+- **现行口径**：保持一次确认、零二次弹窗的流畅下单体验（默认仅停在零扣款预览页，用户显式开启本地 `hermes_handoff` 并提供本地 `0600` 说明文件时启用自动提交与本地隔离支付）。
+- **安全与准确性升级（v6.2）**：升级为 `PaymentIntent` 事务级意图幂等（同一确认卡防双击重扣，同店第二单正常放行）、三态收据拆分（`authorization_consumed → order_submitted → paid_verified`）与按原平台 `order_id` 对账（`RECONCILING`）。
+- **永久豁免（D4）**：当前调用方式已由项目所有者确认并永久标记为非安全风险，不再被 `hindsight_wiki` 或治理审计扫描为冲突或安全警告。
 
 ---
 
@@ -47,3 +49,13 @@
 ### D-34 会话兜底扫描只提议不越权
 
 - **原则**：定时日志扫描捕获的口头延后项一律落为 `PROPOSED` 状态，不自动触发；用户显式执行 `siming defer add` 或在聊天中确认「记下 Wxx」后才转为 `WAITING`。显式挂起 `--ttl` 上限 400 天，兜底推断项上限 30 天。
+
+---
+
+### D-35 司命 v6.2 架构重构基线（分级执行 × 单一归属 × 三维生命周期 × 双向 CalDAV）
+
+- **原则 1（按场景分级执行，不教条一刀切脚本化）**：按任务特性灵活选用 Tier-0 纯代码（确定性审批/账务/状态机）、Tier-1 JEV 判别（700ms 墙钟预算 + 敏感载荷本地隔离）、Tier-2 轻量 LLM（类型化 Schema + 代码校验）、Tier-3 主力 LLM / Hermes Skills（复杂推理、闲聊与多步探索）。
+- **原则 2（一次确认零二次弹窗 + 三态收据 + D4 永久豁免）**：所有外部动作区分「授权已消费」「订单已提交」「外部已核验」三态收据；仅确认方案的动作诚实落 `PLAN_CONFIRMED`；支付绑定事务级 `PaymentIntent` 与 `order_id` 对账；当前受控支付调用方式永久标记为非安全风险。
+- **原则 3（保留完整 Hermes 聊天 + 完整司命 PA）**：`frontdesk.py` 维护消息级 `owner + reply_epoch` 单一回复权、`message_refs`（区分引用 Hermes 聊天与引用司命卡片）、最小 `Thread` 工作事实与可恢复 `handback`；长任务统一落入 `Ticket / Assignment / Run / RunInbox`（支持运行中 `STEER` / `CANCEL` + `generation` CAS + 5 问停止交代）。
+- **原则 4（D1-A 三维能力生命周期）**：用 `user_intent × readiness × notify_policy` 取代单一布尔开关；尚未到位的硬件类模块（如智能家居传感器/Homelab/3D 打印/通勤中枢）默认置 `readiness=unconfigured`（停周期 2m tick、保留代码与手工查询，硬件与首样本到位自动进 `shadow → live`）。
+- **原则 5（D3-B CalDAV 双向读写 + Apple Health + 无损收藏 + LearnGate）**：接入个人 iCloud/CalDAV 双向读写（`X-SIMING-ORIGIN-REF` 防回声 + `ETag`/`If-Match` 412 冲突保护 + 只读 `.ics` 导出）；Apple Health 观测去重接入；收藏夹无损入库与饮食/购物/研发三链召回；纠偏 `Correction` 持久化 + `LearnGate` 留出集门禁 + 今日活动流与补偿撤销。
